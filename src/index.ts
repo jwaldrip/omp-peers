@@ -100,10 +100,21 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     trace(root, "session_start", { sessionId: currentSessionId, cwd: ctx.cwd });
 
     // Materialize session file on disk so --resume always finds it even if stopped immediately
-    try {
-      pi.appendEntry("peer-init", { initialized: true });
-    } catch {
-      // Ignore entry append error
+    const sessionFile = ctx.sessionManager?.getSessionFile?.();
+    if (sessionFile && !fs.existsSync(sessionFile)) {
+      const header = ctx.sessionManager?.getHeader?.() || {
+        type: "session",
+        version: 3,
+        id: currentSessionId,
+        timestamp: new Date().toISOString(),
+        cwd: path.resolve(ctx.cwd),
+      };
+      try {
+        fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+        fs.writeFileSync(sessionFile, JSON.stringify(header) + "\n", { mode: 0o600 });
+      } catch {
+        // Ignore file write error
+      }
     }
 
     await updateHeartbeat(ctx);
@@ -249,8 +260,10 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   pi.on("agent_end", async (event, ctx) => {
     await updateHeartbeat(ctx);
     if (deliveryMachine) {
-      await deliveryMachine.onAgentEnd(event.messages);
-      void deliveryMachine.processInbox();
+      const { isAborted } = await deliveryMachine.onAgentEnd(event.messages);
+      if (!isAborted) {
+        void deliveryMachine.processInbox();
+      }
     }
   });
 

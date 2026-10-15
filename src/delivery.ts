@@ -198,30 +198,49 @@ export class DeliveryStateMachine {
     }
   }
 
-  public async onAgentEnd(messages: readonly unknown[]): Promise<void> {
+  public async onAgentEnd(messages: readonly unknown[]): Promise<{ isAborted: boolean }> {
     // 1. Verify entries for any recorded messages
     await this.checkAckAgainstEntries();
 
-    if (this.inFlight.size === 0) {
-      return;
-    }
-
-    // 2. While hasPendingMessages() is true, do not re-submit
-    if (this.host.hasPendingMessages()) {
-      return;
-    }
-
-    // Check if run ended by abort
+    // Check if run ended by abort (on assistant message or toolResult)
     const isAborted = messages.some((m: unknown) => {
       if (!m || typeof m !== "object") return false;
       const msg = m as Record<string, unknown>;
+      const role = msg.role;
       const stopReason = msg.stopReason;
       const isAbortReason =
         stopReason === "aborted" ||
         (typeof stopReason === "string" && stopReason !== "stop" && stopReason !== "toolUse");
       const errorMsg = typeof msg.errorMessage === "string" ? msg.errorMessage.toLowerCase() : "";
-      return isAbortReason || errorMsg.includes("abort") || msg.aborted === true;
+      if (isAbortReason || errorMsg.includes("abort") || msg.aborted === true) {
+        return true;
+      }
+
+      // Check toolResult messages for abort signals
+      if (role === "toolResult") {
+        const details = msg.details as Record<string, unknown> | undefined;
+        if (details?.source === "assistant_stop_aborted") {
+          return true;
+        }
+        const contentStr = typeof msg.content === "string"
+          ? msg.content.toLowerCase()
+          : JSON.stringify(msg.content ?? "").toLowerCase();
+        if (contentStr.includes("abort") || contentStr.includes("interrupted")) {
+          return true;
+        }
+      }
+
+      return false;
     });
+
+    if (this.inFlight.size === 0) {
+      return { isAborted };
+    }
+
+    // 2. While hasPendingMessages() is true, do not re-submit
+    if (this.host.hasPendingMessages()) {
+      return { isAborted };
+    }
 
     for (const [id, item] of Array.from(this.inFlight.entries())) {
       // Final check against session entries
@@ -265,6 +284,8 @@ export class DeliveryStateMachine {
         this.host.sendMessage(payload, { triggerTurn: true });
       }
     }
+
+    return { isAborted };
   }
 
   public async ackMessage(
