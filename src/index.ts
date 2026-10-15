@@ -99,6 +99,13 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     currentSessionId = ctx.sessionManager.getSessionId();
     trace(root, "session_start", { sessionId: currentSessionId, cwd: ctx.cwd });
 
+    // Materialize session file on disk so --resume always finds it even if stopped immediately
+    try {
+      pi.appendEntry("peer-init", { initialized: true });
+    } catch {
+      // Ignore entry append error
+    }
+
     await updateHeartbeat(ctx);
 
     // Start delivery state machine
