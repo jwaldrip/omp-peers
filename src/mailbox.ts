@@ -26,10 +26,30 @@ export function trace(root: string, event: string, data: Record<string, unknown>
 
 export async function ensureDir(dirPath: string): Promise<void> {
   await fs.promises.mkdir(dirPath, { recursive: true, mode: 0o700 });
+  try {
+    await fs.promises.chmod(dirPath, 0o700);
+  } catch {
+    // Ignore chmod failure
+  }
 }
 
 export function ensureDirSync(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dirPath, 0o700);
+  } catch {
+    // Ignore chmod failure
+  }
+}
+
+export function isPidAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function writeAtomicFile(filePath: string, content: string): Promise<void> {
@@ -41,6 +61,11 @@ export async function writeAtomicFile(filePath: string, content: string): Promis
   );
   try {
     await fs.promises.writeFile(tmpFile, content, { encoding: "utf8", mode: 0o600 });
+    try {
+      await fs.promises.chmod(tmpFile, 0o600);
+    } catch {
+      // Ignore chmod error
+    }
     await fs.promises.rename(tmpFile, filePath);
   } catch (err) {
     try {
@@ -61,6 +86,11 @@ export function writeAtomicFileSync(filePath: string, content: string): void {
   );
   try {
     fs.writeFileSync(tmpFile, content, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.chmodSync(tmpFile, 0o600);
+    } catch {
+      // Ignore chmod error
+    }
     fs.renameSync(tmpFile, filePath);
   } catch (err) {
     try {
@@ -69,16 +99,6 @@ export function writeAtomicFileSync(filePath: string, content: string): void {
       // Ignore cleanup error
     }
     throw err;
-  }
-}
-
-export function isPidAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -194,7 +214,6 @@ export async function reclaimDeadPidClaims(
       }
     }
 
-    // Try removing empty dead pid directory
     try {
       await fs.promises.rmdir(pidDir);
     } catch {
@@ -261,15 +280,60 @@ export async function waitForReceipt(
   messageId: string,
   timeoutMs: number
 ): Promise<DeliveryReceipt | null> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const receipt = await readReceipt(root, fromSessionId, messageId);
-    if (receipt) {
-      return receipt;
+  const initial = await readReceipt(root, fromSessionId, messageId);
+  if (initial) return initial;
+  if (timeoutMs <= 0) return null;
+
+  const { promise, resolve } = Promise.withResolvers<DeliveryReceipt | null>();
+  const receiptsDir = path.join(root, "receipts", fromSessionId);
+  await ensureDir(receiptsDir);
+
+  let watcher: fs.FSWatcher | null = null;
+  let pollInterval: NodeJS.Timeout | undefined;
+  let timeoutTimer: NodeJS.Timeout | undefined;
+  let settled = false;
+
+  const cleanup = () => {
+    settled = true;
+    clearTimeout(timeoutTimer);
+    clearInterval(pollInterval);
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {}
+      watcher = null;
     }
-    await new Promise((r) => setTimeout(r, 50));
+  };
+
+  const check = async () => {
+    if (settled) return;
+    const r = await readReceipt(root, fromSessionId, messageId);
+    if (r && !settled) {
+      cleanup();
+      resolve(r);
+    }
+  };
+
+  timeoutTimer = setTimeout(() => {
+    if (!settled) {
+      cleanup();
+      resolve(null);
+    }
+  }, timeoutMs);
+
+  try {
+    watcher = fs.watch(receiptsDir, () => {
+      void check();
+    });
+  } catch {
+    // fs.watch fallback to polling
   }
-  return null;
+
+  pollInterval = setInterval(() => {
+    void check();
+  }, 40);
+
+  return promise;
 }
 
 export async function countUndeliveredMessages(
