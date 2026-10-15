@@ -547,7 +547,7 @@ export class ProofEnvironment {
 
 		fs.writeFileSync(
 			this.configPath,
-			`todo:\n  enabled: false\n  eager: default\ntask:\n  eager: never\n`,
+			`todo:\n  enabled: false\n  eager: default\ntask:\n  eager: never\nasync:\n  enabled: false\n`,
 		);
 	}
 
@@ -901,9 +901,14 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const eventIndexBefore = sessionB.events.length;
 
 		await delay(10000);
-
+		// A turn counts against the contract only when a peer-message is what started it.
+		// Other wakes (an async job completing, a user prompt) are not ours to suppress.
 		for (let i = eventIndexBefore; i < sessionB.events.length; i++) {
-			if (sessionB.events[i].type === "agent_start") {
+			if (sessionB.events[i].type !== "agent_start") continue;
+			const trigger = sessionB.events
+				.slice(i + 1)
+				.find(e => e.type === "message_end" && e.message?.role !== "assistant");
+			if (trigger?.message?.customType === "peer-message") {
 				turnStarted = true;
 				break;
 			}
@@ -1023,7 +1028,9 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		});
 
 		console.log(`[Scenario D] Resumed B started. Waiting for offline message delivery...`);
-		const cpResumed = resumedB.markEventCheckpoint();
+		// Fresh process: the extension can deliver and start the turn before createSession returns,
+		// so scan from the first event rather than from a checkpoint taken afterwards.
+		const cpResumed = 0;
 		await resumedB.waitForPeerMessage(nonce3, 60000, cpResumed);
 		await resumedB.waitForEvent(e => e.type === "agent_start", 60000, cpResumed);
 

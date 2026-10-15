@@ -131,6 +131,8 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       autocompleteInstalled = true;
       try {
         ctx.ui.addAutocompleteProvider((baseProvider) => {
+          // omp's own `@file` items also start with "@"; only the values offered here are ours to apply.
+          const peerValues = new Set<string>();
           return {
             async getSuggestions(lines, cursorLine, cursorCol) {
               const line = lines[cursorLine] || "";
@@ -159,6 +161,8 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
                 label: `@${s.name} [${s.id8}]`,
                 description: `${s.effectiveStatus} - ${s.cwd}`,
               }));
+              peerValues.clear();
+              for (const item of peerItems) peerValues.add(item.value);
 
               const baseItems = baseResult?.items ?? [];
               return {
@@ -167,7 +171,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
               };
             },
             applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-              if (item.value.startsWith("@")) {
+              if (peerValues.has(item.value)) {
                 const line = lines[cursorLine] || "";
                 const before = line.slice(0, cursorCol - prefix.length);
                 const after = line.slice(cursorCol);
