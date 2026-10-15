@@ -17,21 +17,31 @@ export interface InFlightMessage {
   submittedAt: number;
 }
 
+export interface PendingResubmitItem {
+  envelope: PeerMessageEnvelope;
+  claimedPath: string;
+  mode: "woke" | "appended";
+  lastSentAt?: number;
+}
+
 export function escapeXmlAttr(str: string): string {
   return str
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;");
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export function renderIncomingPrompt(msg: PeerMessageEnvelope): string {
   const sentIso = new Date(msg.sentAt).toISOString();
-  return incomingPromptTemplate
-    .replace(/\{\{name\}\}/g, escapeXmlAttr(msg.from.name))
-    .replace(/\{\{sessionId\}\}/g, escapeXmlAttr(msg.from.sessionId))
-    .replace(/\{\{cwd\}\}/g, escapeXmlAttr(msg.from.cwd))
-    .replace(/\{\{sentIso\}\}/g, escapeXmlAttr(sentIso))
-    .replace(/\{\{body\}\}/g, msg.body);
+  const values: Record<string, string> = {
+    name: escapeXmlAttr(msg.from.name),
+    sessionId: escapeXmlAttr(msg.from.sessionId),
+    cwd: escapeXmlAttr(msg.from.cwd),
+    sentIso: escapeXmlAttr(sentIso),
+    body: msg.body,
+  };
+  return incomingPromptTemplate.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => values[key] ?? "");
 }
 
 export function isRunAborted(messages: readonly unknown[]): boolean {
@@ -67,10 +77,7 @@ export class DeliveryStateMachine {
   private readonly host: DeliveryHost;
 
   private inFlight = new Map<string, InFlightMessage>();
-  private pendingResubmit = new Map<
-    string,
-    { envelope: PeerMessageEnvelope; claimedPath: string; mode: "woke" | "appended" }
-  >();
+  private pendingResubmit = new Map<string, PendingResubmitItem>();
 
   private watcher: fs.FSWatcher | null = null;
   private pollTimer: NodeJS.Timeout | undefined;
@@ -134,6 +141,7 @@ export class DeliveryStateMachine {
 
       // 2. Handle pending resubmissions once idle and no pending messages
       if (this.pendingResubmit.size > 0 && this.host.isIdle() && !this.host.hasPendingMessages()) {
+        const now = Date.now();
         for (const [id, item] of Array.from(this.pendingResubmit.entries())) {
           // Check if already in entries
           if (this.isEntryInStore(id)) {
@@ -161,14 +169,20 @@ export class DeliveryStateMachine {
           };
 
           if (item.mode === "appended") {
+            // Do not re-send the same message within 10s (sendMessage is async in omp)
+            if (item.lastSentAt && now - item.lastSentAt < 10000) {
+              continue;
+            }
+            item.lastSentAt = now;
             this.host.sendMessage(payload, { triggerTurn: false });
-            // Verify if now present in entries
+
+            // If immediately visible in store, ack right away
             if (this.isEntryInStore(id)) {
               this.pendingResubmit.delete(id);
               await markDelivered(this.root, item.envelope, item.claimedPath, "appended");
             }
           } else {
-            // woke
+            // mode: woke
             this.pendingResubmit.delete(id);
             this.inFlight.set(id, {
               envelope: item.envelope,

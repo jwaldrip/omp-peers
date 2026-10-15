@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
@@ -7,6 +6,8 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
+import listPiDescription from "./prompts/list-pi.md" with { type: "text" };
+import sendPiMessageDescription from "./prompts/send-pi-message.md" with { type: "text" };
 import { DeliveryStateMachine } from "./delivery.js";
 import {
   getPeersDir,
@@ -40,6 +41,8 @@ export function isSubagentSession(ctx: ExtensionContext): boolean {
   return false;
 }
 
+import * as fs from "node:fs";
+
 export default function ompPeersExtension(pi: ExtensionAPI): void {
   const root = getPeersDir();
   let currentSessionId = "";
@@ -48,6 +51,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let lastRegisteredName = "";
   let isSubagent = false;
+  let autocompleteInstalled = false;
 
   const updateHeartbeat = async (ctx: ExtensionContext, forceStatus?: "idle" | "busy" | "offline"): Promise<void> => {
     if (isSubagent || !currentSessionId) return;
@@ -74,7 +78,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  const setupSession = async (ctx: ExtensionContext): Promise<void> => {
     if (isSubagentSession(ctx)) {
       isSubagent = true;
       const activeTools = pi.getActiveTools();
@@ -85,17 +89,29 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    if (currentSessionId) {
+      markOfflineSync(root, currentSessionId);
+    }
+    if (deliveryMachine) {
+      deliveryMachine.stop();
+      deliveryMachine = null;
+    }
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+
     currentSessionId = ctx.sessionManager.getSessionId();
     sessionStartedAt = Date.now();
-    trace(root, "session_start", { sessionId: currentSessionId, cwd: ctx.cwd });
+    trace(root, "session_setup", { sessionId: currentSessionId, cwd: ctx.cwd });
 
     await updateHeartbeat(ctx);
 
-    // Start delivery state machine
     const host = {
       isIdle: () => ctx.isIdle(),
       hasPendingMessages: () => ctx.hasPendingMessages(),
-      sendMessage: (payload: Parameters<ExtensionAPI["sendMessage"]>[0], options?: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
+      sendMessage: (
+        payload: Parameters<ExtensionAPI["sendMessage"]>[0],
+        options?: Parameters<ExtensionAPI["sendMessage"]>[1]
+      ) => {
         pi.sendMessage(payload, options);
       },
       getEntries: () => ctx.sessionManager.getEntries(),
@@ -104,15 +120,15 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     deliveryMachine = new DeliveryStateMachine(root, currentSessionId, process.pid, host);
     await deliveryMachine.start();
 
-    // Heartbeat every 5s
-    clearInterval(heartbeatTimer);
+    // Heartbeat every 5s using the current session context
     heartbeatTimer = setInterval(() => {
       void updateHeartbeat(ctx);
     }, 5000);
     heartbeatTimer.unref();
 
     // Autocomplete provider for '@'
-    if (ctx.hasUI && typeof ctx.ui?.addAutocompleteProvider === "function") {
+    if (!autocompleteInstalled && ctx.hasUI && typeof ctx.ui?.addAutocompleteProvider === "function") {
+      autocompleteInstalled = true;
       try {
         ctx.ui.addAutocompleteProvider((baseProvider) => {
           return {
@@ -120,9 +136,12 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
               const line = lines[cursorLine] || "";
               const textBeforeCursor = line.slice(0, cursorCol);
               const atMatch = textBeforeCursor.match(/@(\S*)$/);
+              const baseResult = await baseProvider.getSuggestions(lines, cursorLine, cursorCol);
+
               if (!atMatch) {
-                return baseProvider.getSuggestions(lines, cursorLine, cursorCol);
+                return baseResult;
               }
+
               const query = atMatch[1].toLowerCase();
               const sessions = await listSessions(root, currentSessionId, false);
               const matched = sessions.filter(
@@ -130,13 +149,20 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
                   s.name.toLowerCase().includes(query) ||
                   s.id8.toLowerCase().includes(query)
               );
-              const items = matched.map((s) => ({
+
+              if (matched.length === 0) {
+                return baseResult;
+              }
+
+              const peerItems = matched.map((s) => ({
                 value: `@${s.name} [${s.id8}]`,
                 label: `@${s.name} [${s.id8}]`,
                 description: `${s.effectiveStatus} - ${s.cwd}`,
               }));
+
+              const baseItems = baseResult?.items ?? [];
               return {
-                items,
+                items: [...peerItems, ...baseItems],
                 prefix: atMatch[0],
               };
             },
@@ -162,58 +188,18 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
         // Autocomplete setup skipped if not supported
       }
     }
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    await setupSession(ctx);
   });
 
   pi.on("session_switch", async (_event, ctx) => {
-    if (isSubagent) return;
-    if (currentSessionId) {
-      markOfflineSync(root, currentSessionId);
-    }
-    if (deliveryMachine) {
-      deliveryMachine.stop();
-    }
-
-    currentSessionId = ctx.sessionManager.getSessionId();
-    sessionStartedAt = Date.now();
-    await updateHeartbeat(ctx);
-
-    const host = {
-      isIdle: () => ctx.isIdle(),
-      hasPendingMessages: () => ctx.hasPendingMessages(),
-      sendMessage: (payload: Parameters<ExtensionAPI["sendMessage"]>[0], options?: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
-        pi.sendMessage(payload, options);
-      },
-      getEntries: () => ctx.sessionManager.getEntries(),
-    };
-
-    deliveryMachine = new DeliveryStateMachine(root, currentSessionId, process.pid, host);
-    await deliveryMachine.start();
+    await setupSession(ctx);
   });
 
   pi.on("session_branch", async (_event, ctx) => {
-    if (isSubagent) return;
-    if (currentSessionId) {
-      markOfflineSync(root, currentSessionId);
-    }
-    if (deliveryMachine) {
-      deliveryMachine.stop();
-    }
-
-    currentSessionId = ctx.sessionManager.getSessionId();
-    sessionStartedAt = Date.now();
-    await updateHeartbeat(ctx);
-
-    const host = {
-      isIdle: () => ctx.isIdle(),
-      hasPendingMessages: () => ctx.hasPendingMessages(),
-      sendMessage: (payload: Parameters<ExtensionAPI["sendMessage"]>[0], options?: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
-        pi.sendMessage(payload, options);
-      },
-      getEntries: () => ctx.sessionManager.getEntries(),
-    };
-
-    deliveryMachine = new DeliveryStateMachine(root, currentSessionId, process.pid, host);
-    await deliveryMachine.start();
+    await setupSession(ctx);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -329,7 +315,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "list_pi",
     label: "List Pi Sessions",
-    description: "List other active or offline OMP sessions on this machine.",
+    description: listPiDescription.trim(),
     loadMode: "essential",
     parameters: listPiSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
@@ -374,7 +360,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "send_pi_message",
     label: "Send Pi Message",
-    description: "Send a message to another OMP session on this machine.",
+    description: sendPiMessageDescription.trim(),
     loadMode: "essential",
     parameters: sendPiMessageSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
