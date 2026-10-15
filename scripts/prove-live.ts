@@ -833,7 +833,8 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce1}"}. Do not call any other tool.`);
 		const aToolEnd1 = await aToolEndPromise1;
 		const message1Id = aToolEnd1.result?.details?.messageId;
-		console.log(`[Scenario C] Nonce1 sent (messageId: ${message1Id}).`);
+		console.log(`[Scenario C] Nonce1 sent (messageId: ${message1Id}). Waiting for A's turn to settle...`);
+		await sessionA.waitForAgentEnd(60000, cpA1);
 
 		// Give a brief moment for extension to process the inbox file before aborting
 		await delay(600);
