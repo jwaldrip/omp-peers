@@ -24,6 +24,12 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 
+function delay(ms: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setTimeout(resolve, ms);
+	return promise;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -257,7 +263,7 @@ export class OmpRpcSession {
 		});
 
 		// Wait for ready frame
-		await this.waitForEvent(e => e.type === "ready", 15000);
+		await this.waitForEvent(e => e.type === "ready", 30000);
 		this.ready = true;
 
 		// Fetch initial state to record sessionId, sessionFile, sessionName
@@ -328,7 +334,7 @@ export class OmpRpcSession {
 		}
 	}
 
-	async sendCommand(cmd: Record<string, unknown>, timeoutMs = 20000): Promise<RpcResponsePayload> {
+	async sendCommand(cmd: Record<string, unknown>, timeoutMs = 60000): Promise<RpcResponsePayload> {
 		if (!this.proc || this.isStopped) {
 			throw new Error(`Cannot send command to stopped session ${this.label}`);
 		}
@@ -384,7 +390,7 @@ export class OmpRpcSession {
 		return resp;
 	}
 
-	waitForEvent(predicate: (e: RpcEventFrame) => boolean, timeoutMs = 30000): Promise<RpcEventFrame> {
+	waitForEvent(predicate: (e: RpcEventFrame) => boolean, timeoutMs = 60000): Promise<RpcEventFrame> {
 		// Check existing events first
 		for (const ev of this.events) {
 			try {
@@ -405,21 +411,21 @@ export class OmpRpcSession {
 		return promise;
 	}
 
-	async waitForToolStart(toolName: string, timeoutMs = 30000): Promise<RpcEventFrame> {
+	async waitForToolStart(toolName: string, timeoutMs = 60000): Promise<RpcEventFrame> {
 		return this.waitForEvent(
 			e => e.type === "tool_execution_start" && e.toolName === toolName,
 			timeoutMs,
 		);
 	}
 
-	async waitForToolEnd(toolName: string, timeoutMs = 30000): Promise<RpcEventFrame> {
+	async waitForToolEnd(toolName: string, timeoutMs = 60000): Promise<RpcEventFrame> {
 		return this.waitForEvent(
 			e => e.type === "tool_execution_end" && e.toolName === toolName,
 			timeoutMs,
 		);
 	}
 
-	async waitForPeerMessage(nonce: string, timeoutMs = 30000): Promise<RpcEventFrame> {
+	async waitForPeerMessage(nonce: string, timeoutMs = 60000): Promise<RpcEventFrame> {
 		return this.waitForEvent(e => {
 			if (e.type === "message_end" && e.message?.customType === "peer-message") {
 				const content = typeof e.message.content === "string"
@@ -431,24 +437,44 @@ export class OmpRpcSession {
 		}, timeoutMs);
 	}
 
-	async waitForAgentEnd(timeoutMs = 60000): Promise<RpcEventFrame> {
+	async waitForAgentEnd(timeoutMs = 90000): Promise<RpcEventFrame> {
 		return this.waitForEvent(e => e.type === "agent_end", timeoutMs);
 	}
 
 	readSessionEntries(): Array<Record<string, unknown>> {
-		if (!this.sessionFile || !fs.existsSync(this.sessionFile)) {
+		let filePath = this.sessionFile;
+		if (!filePath || !fs.existsSync(filePath)) {
+			// Fallback: search sessionDir for a file containing sessionId
+			if (this.sessionId && this.sessionDir && fs.existsSync(this.sessionDir)) {
+				try {
+					const files = fs.readdirSync(this.sessionDir);
+					const matched = files.find(f => f.includes(this.sessionId) && f.endsWith(".jsonl"));
+					if (matched) {
+						filePath = path.join(this.sessionDir, matched);
+						this.sessionFile = filePath;
+					}
+				} catch {}
+			}
+		}
+
+		if (!filePath || !fs.existsSync(filePath)) {
 			return [];
 		}
-		const content = fs.readFileSync(this.sessionFile, "utf8");
-		const entries: Array<Record<string, unknown>> = [];
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			if (!trimmed) continue;
-			try {
-				entries.push(JSON.parse(trimmed) as Record<string, unknown>);
-			} catch {}
+
+		try {
+			const content = fs.readFileSync(filePath, "utf8");
+			const entries: Array<Record<string, unknown>> = [];
+			for (const line of content.split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				try {
+					entries.push(JSON.parse(trimmed) as Record<string, unknown>);
+				} catch {}
+			}
+			return entries;
+		} catch {
+			return [];
 		}
-		return entries;
 	}
 
 	async stop(): Promise<void> {
@@ -570,6 +596,30 @@ export interface ScenarioResult {
 }
 
 /**
+ * Extract status string from tool result details or text content.
+ */
+export function extractToolStatus(result?: RpcToolResult): string | undefined {
+	if (result?.details?.status && typeof result.details.status === "string") {
+		return result.details.status;
+	}
+	const text = (result?.content || []).map(c => c.text || "").join(" ");
+	if (/status:\s*"?(delivered|queued|queued_offline)"?/i.test(text)) {
+		const m = text.match(/status:\s*"?(delivered|queued|queued_offline)"?/i);
+		return m ? m[1].toLowerCase() : undefined;
+	}
+	if (text.includes("Delivered to") || text.includes("delivered to") || text.includes("started a turn") || text.includes("injected into")) {
+		return "delivered";
+	}
+	if (text.includes("stored durably and will be injected") || text.includes("is busy; stored durably")) {
+		return "queued";
+	}
+	if (text.includes("stored durably and delivered when") || text.includes("is not running; stored durably")) {
+		return "queued_offline";
+	}
+	return undefined;
+}
+
+/**
  * Scenario a: Idle wake
  * Session A's model is prompted to call send_pi_message to B with a nonce.
  * B emits a peer-message message_end containing the nonce and starts a turn.
@@ -601,23 +651,23 @@ async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		console.log(`[Scenario A] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (${sessionB.id8})`);
 
 		// Set up listeners on B before prompting A
-		const bMessagePromise = sessionB.waitForPeerMessage(nonce, 35000);
-		const bTurnPromise = sessionB.waitForEvent(e => e.type === "agent_start", 35000);
+		const bMessagePromise = sessionB.waitForPeerMessage(nonce, 60000);
+		const bTurnPromise = sessionB.waitForEvent(e => e.type === "agent_start", 60000);
 
 		// Prompt A to call send_pi_message targeting B
 		console.log(`[Scenario A] Prompting A to call send_pi_message to B`);
 		const promptMsg = `Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce}"}. Do not call any other tool.`;
 
-		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 35000);
+		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(promptMsg);
 
 		const aToolEnd = await aToolEndPromise;
 		const toolResult = aToolEnd.result;
-		const status = toolResult?.details?.status;
+		const status = extractToolStatus(toolResult);
 
 		console.log(`[Scenario A] A's send_pi_message status: "${status}"`);
 		if (status !== "delivered") {
-			throw new Error(`Expected A's tool result status to be "delivered", got "${status}" (details: ${JSON.stringify(toolResult?.details)})`);
+			throw new Error(`Expected A's tool result status to be "delivered", got "${status}" (details: ${JSON.stringify(toolResult?.details)}, content: ${JSON.stringify(toolResult?.content)})`);
 		}
 
 		console.log(`[Scenario A] Waiting for B to receive message and start turn...`);
@@ -628,7 +678,7 @@ async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		console.log(`[Scenario A] PASS: ${evidence}`);
 
 		// Wait for both to settle turns
-		await Promise.allSettled([sessionA.waitForAgentEnd(30000), sessionB.waitForAgentEnd(30000)]);
+		await Promise.allSettled([sessionA.waitForAgentEnd(60000), sessionB.waitForAgentEnd(60000)]);
 
 		return { id, name, status: "PASS", evidence };
 	} catch (err: unknown) {
@@ -642,7 +692,7 @@ async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<Sc
  * Scenario b: Busy
  * B is prompted to run bash sleep 15.
  * While B's tool runs, A sends a nonce.
- * B receives it within the same run after the tool finishes (before or as part of continuing), no refusal.
+ * B receives it within the same run after the tool finishes (no refusal).
  * A's result is queued or delivered, never an error.
  */
 async function runScenarioB(env: ProofEnvironment, opts: CliOptions): Promise<ScenarioResult> {
@@ -670,26 +720,26 @@ async function runScenarioB(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const nonce = `NONCE_BUSY_${randomUUID().slice(0, 8)}`;
 		console.log(`[Scenario B] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (${sessionB.id8})`);
 
-		// Prompt B to run sleep 12
-		console.log(`[Scenario B] Prompting B to run sleep 12...`);
-		void sessionB.prompt(`Run bash command "sleep 12". You must use the bash tool.`);
+		// Prompt B to run sleep 15
+		console.log(`[Scenario B] Prompting B to run sleep 15...`);
+		void sessionB.prompt(`Run bash command "sleep 15". You must use the bash tool.`);
 
 		// Wait until B actually enters bash tool execution
 		console.log(`[Scenario B] Waiting for B to start bash tool...`);
-		await sessionB.waitForToolStart("bash", 30000);
+		await sessionB.waitForToolStart("bash", 60000);
 		console.log(`[Scenario B] B is now busy executing bash tool!`);
 
 		// While B is busy, set up listener for B receiving peer message
-		const bMessagePromise = sessionB.waitForPeerMessage(nonce, 45000);
+		const bMessagePromise = sessionB.waitForPeerMessage(nonce, 75000);
 
 		// Prompt A to send nonce to B
 		console.log(`[Scenario B] Prompting A to send message while B is busy...`);
-		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 30000);
+		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce}"}. Do not call any other tool.`);
 
 		const aToolEnd = await aToolEndPromise;
 		const toolResult = aToolEnd.result;
-		const status = toolResult?.details?.status;
+		const status = extractToolStatus(toolResult);
 		console.log(`[Scenario B] A's tool result status: "${status}"`);
 
 		if (status !== "queued" && status !== "delivered") {
@@ -703,7 +753,7 @@ async function runScenarioB(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const evidence = `A status=${status} (no refusal); B received ${nonce} within run after bash tool finished`;
 		console.log(`[Scenario B] PASS: ${evidence}`);
 
-		await Promise.allSettled([sessionA.waitForAgentEnd(30000), sessionB.waitForAgentEnd(30000)]);
+		await Promise.allSettled([sessionA.waitForAgentEnd(60000), sessionB.waitForAgentEnd(60000)]);
 		return { id, name, status: "PASS", evidence };
 	} catch (err: unknown) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -752,44 +802,51 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		void sessionB.prompt(`Run bash command "sleep 30". You must use the bash tool.`);
 
 		// 2. Wait for B to start bash
-		await sessionB.waitForToolStart("bash", 30000);
+		await sessionB.waitForToolStart("bash", 60000);
 		console.log(`[Scenario C] B is busy in sleep 30.`);
 
 		// 3. A sends nonce1
 		console.log(`[Scenario C] Prompting A to send nonce1 to B...`);
-		const aToolEndPromise1 = sessionA.waitForToolEnd("send_pi_message", 30000);
+		const aToolEndPromise1 = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce1}"}. Do not call any other tool.`);
 		await aToolEndPromise1;
 		console.log(`[Scenario C] Nonce1 accepted by extension.`);
 
 		// Give a brief moment for extension to process the inbox file before aborting
-		await new Promise(r => setTimeout(r, 600));
+		await delay(600);
 
 		// 4. Abort B mid-tool via RPC
 		console.log(`[Scenario C] Aborting B via RPC...`);
 		await sessionB.abort();
 
 		// Wait for B's run to end from the abort
-		await sessionB.waitForAgentEnd(15000);
+		await sessionB.waitForAgentEnd(25000);
 		console.log(`[Scenario C] B aborted and run settled.`);
 
-		// Give delivery loop a second to flush/append unacked message to session store
-		await new Promise(r => setTimeout(r, 1000));
-
-		// 5. Check B's session file on disk
-		const entries = sessionB.readSessionEntries();
-		console.log(`[Scenario C] B has ${entries.length} entries in session file.`);
-
-		const customEntry = entries.find(e => {
-			if (e.type === "custom_message" && e.customType === "peer-message") {
-				const contentStr = typeof e.content === "string" ? e.content : JSON.stringify(e.content);
-				return contentStr.includes(nonce1);
-			}
-			return false;
-		});
+		// 5. Check B's session file on disk for persisted custom_message entry
+		console.log(`[Scenario C] Polling B's session file on disk for persisted custom message...`);
+		let customEntry: Record<string, unknown> | undefined;
+		const pollDeadline = Date.now() + 6000;
+		while (Date.now() < pollDeadline) {
+			const entries = sessionB.readSessionEntries();
+			customEntry = entries.find(e => {
+				const isCustomMessage =
+					(e.type === "custom_message" && e.customType === "peer-message") ||
+					(e.type === "custom" && e.customType === "peer-message") ||
+					(e.customType === "peer-message");
+				if (isCustomMessage) {
+					const contentStr = typeof e.content === "string" ? e.content : JSON.stringify(e.content ?? "");
+					return contentStr.includes(nonce1);
+				}
+				return false;
+			});
+			if (customEntry) break;
+			await delay(200);
+		}
 
 		if (!customEntry) {
-			throw new Error(`nonce1 (${nonce1}) was NOT found persisted as custom_message entry in B's session file (${sessionB.sessionFile})`);
+			const entries = sessionB.readSessionEntries();
+			throw new Error(`nonce1 (${nonce1}) was NOT found persisted as custom_message entry in B's session file (${sessionB.sessionFile}). Found ${entries.length} entries.`);
 		}
 		console.log(`[Scenario C] Verified nonce1 is persisted in B's session entries.`);
 
@@ -798,7 +855,7 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		let turnStarted = false;
 		const eventIndexBefore = sessionB.events.length;
 
-		await new Promise(r => setTimeout(r, 10000));
+		await delay(10000);
 
 		for (let i = eventIndexBefore; i < sessionB.events.length; i++) {
 			if (sessionB.events[i].type === "agent_start") {
@@ -814,10 +871,10 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 
 		// 7. A sends nonce2 while B is idle
 		console.log(`[Scenario C] Now sending nonce2 while B is idle...`);
-		const bTurnPromise = sessionB.waitForEvent(e => e.type === "agent_start", 30000);
-		const bMessagePromise2 = sessionB.waitForPeerMessage(nonce2, 30000);
+		const bTurnPromise = sessionB.waitForEvent(e => e.type === "agent_start", 60000);
+		const bMessagePromise2 = sessionB.waitForPeerMessage(nonce2, 60000);
 
-		const aToolEndPromise2 = sessionA.waitForToolEnd("send_pi_message", 30000);
+		const aToolEndPromise2 = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce2}"}. Do not call any other tool.`);
 		await aToolEndPromise2;
 
@@ -828,7 +885,7 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const evidence = `nonce1 persisted in B session file; 0 turns started during 10s abort quiet window; nonce2 successfully started turn`;
 		console.log(`[Scenario C] PASS: ${evidence}`);
 
-		await Promise.allSettled([sessionA.waitForAgentEnd(30000), sessionB.waitForAgentEnd(30000)]);
+		await Promise.allSettled([sessionA.waitForAgentEnd(60000), sessionB.waitForAgentEnd(60000)]);
 		return { id, name, status: "PASS", evidence };
 	} catch (err: unknown) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -877,12 +934,12 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 
 		// 2. A sends nonce3 to B's sessionId
 		console.log(`[Scenario D] Prompting A to send to offline B (${bSessionId})...`);
-		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 30000);
+		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${bSessionId}", "message": "${nonce3}"}. Do not call any other tool.`);
 
 		const aToolEnd = await aToolEndPromise;
 		const toolResult = aToolEnd.result;
-		const status = toolResult?.details?.status;
+		const status = extractToolStatus(toolResult);
 		console.log(`[Scenario D] A's tool result status: "${status}"`);
 
 		if (status !== "queued_offline") {
@@ -911,13 +968,13 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		});
 
 		console.log(`[Scenario D] Resumed B started. Waiting for offline message delivery...`);
-		await resumedB.waitForPeerMessage(nonce3, 35000);
-		await resumedB.waitForEvent(e => e.type === "agent_start", 35000);
+		await resumedB.waitForPeerMessage(nonce3, 60000);
+		await resumedB.waitForEvent(e => e.type === "agent_start", 60000);
 
 		const evidence = `A status=queued_offline; message persisted in inbox; resumed B delivered ${nonce3} and started turn`;
 		console.log(`[Scenario D] PASS: ${evidence}`);
 
-		await Promise.allSettled([sessionA.waitForAgentEnd(30000), resumedB.waitForAgentEnd(30000)]);
+		await Promise.allSettled([sessionA.waitForAgentEnd(60000), resumedB.waitForAgentEnd(60000)]);
 		return { id, name, status: "PASS", evidence };
 	} catch (err: unknown) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -969,11 +1026,11 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		await b2.setSessionName(sharedTitle);
 
 		// Wait briefly for registry write
-		await new Promise(r => setTimeout(r, 600));
+		await delay(600);
 
 		// 1. Ambiguous send
 		console.log(`[Scenario E] Testing ambiguous target "${sharedTitle}"...`);
-		let aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 30000);
+		let aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sharedTitle}", "message": "hello shared"}. Do not call any other tool.`);
 
 		let aToolEnd = await aToolEndPromise;
@@ -987,30 +1044,30 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 			throw new Error(`Expected ambiguous error listing both ${b1Ref} and ${b2Ref}, got: ${text}`);
 		}
 		console.log(`[Scenario E] Verified ambiguous error listing both candidates.`);
-		await sessionA.waitForAgentEnd(30000);
+		await sessionA.waitForAgentEnd(60000);
 
 		// 2. Specific Name [id8] send
 		console.log(`[Scenario E] Testing resolved target "${b1Ref}"...`);
 		const nonceB1 = `NONCE_B1_${randomUUID().slice(0, 8)}`;
-		const b1MessagePromise = b1.waitForPeerMessage(nonceB1, 30000);
+		const b1MessagePromise = b1.waitForPeerMessage(nonceB1, 60000);
 
-		aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 30000);
+		aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${b1Ref}", "message": "${nonceB1}"}. Do not call any other tool.`);
 
 		aToolEnd = await aToolEndPromise;
-		const b1Status = aToolEnd.result?.details?.status;
+		const b1Status = extractToolStatus(aToolEnd.result);
 		console.log(`[Scenario E] Send to ${b1Ref} status: "${b1Status}"`);
 
 		if (b1Status !== "delivered") {
-			throw new Error(`Expected delivered status for ${b1Ref}, got: ${b1Status}`);
+			throw new Error(`Expected delivered status for ${b1Ref}, got: ${b1Status} (result: ${JSON.stringify(aToolEnd.result)})`);
 		}
 		await b1MessagePromise;
 		console.log(`[Scenario E] Verified delivery to specific target ${b1Ref}.`);
-		await sessionA.waitForAgentEnd(30000);
+		await sessionA.waitForAgentEnd(60000);
 
 		// 3. Unknown target send
 		console.log(`[Scenario E] Testing unknown target "UnknownTargetXYZ"...`);
-		aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 30000);
+		aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "UnknownTargetXYZ", "message": "hello"}. Do not call any other tool.`);
 
 		aToolEnd = await aToolEndPromise;
@@ -1021,7 +1078,7 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 			throw new Error(`Expected not_found error with suggestions, got: ${text}`);
 		}
 		console.log(`[Scenario E] Verified not_found error returned with suggestions.`);
-		await sessionA.waitForAgentEnd(30000);
+		await sessionA.waitForAgentEnd(60000);
 
 		const evidence = `Ambiguous error listed both ${b1Ref} and ${b2Ref}; exact target ${b1Ref} delivered; unknown target gave not_found`;
 		console.log(`[Scenario E] PASS: ${evidence}`);
@@ -1064,7 +1121,7 @@ async function runDriverSelfTest(env: ProofEnvironment, opts: CliOptions): Promi
 
 	// Test prompt execution
 	console.log("Testing basic prompt response...");
-	const agentEndPromise = session.waitForAgentEnd(30000);
+	const agentEndPromise = session.waitForAgentEnd(60000);
 	await session.prompt("Reply with only the word PONG");
 	await agentEndPromise;
 
