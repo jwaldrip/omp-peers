@@ -833,19 +833,26 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce1}"}. Do not call any other tool.`);
 		const aToolEnd1 = await aToolEndPromise1;
 		const message1Id = aToolEnd1.result?.details?.messageId;
-		console.log(`[Scenario C] Nonce1 sent (messageId: ${message1Id}). Waiting for A's turn to settle...`);
-		await sessionA.waitForAgentEnd(60000, cpA1);
+		console.log(`[Scenario C] Nonce1 sent (messageId: ${message1Id}). Aborting B before it can finish its run...`);
+		// Do not wait for A's run to settle: A's model may take more turns, and by then B's run is over and
+		// there is nothing left to interrupt. The send tool already waited for the claim.
+		await delay(300);
 
-		// Give a brief moment for extension to process the inbox file before aborting
-		await delay(600);
-
-		// 4. Abort B mid-tool via RPC
+		// 4. Abort B via RPC (Esc)
 		console.log(`[Scenario C] Aborting B via RPC...`);
 		const cpBAbort = sessionB.markEventCheckpoint();
 		await sessionB.abort();
 
-		// Wait for B's run to end from the abort
-		await sessionB.waitForAgentEnd(25000, cpBAbort);
+		// Wait for B's run to end from the abort. If B's run had already ended (omp interrupts a running
+		// tool when a steer arrives, so the run can finish quickly), B is idle and there is nothing to wait for.
+		try {
+			await sessionB.waitForAgentEnd(25000, cpBAbort);
+		} catch (err) {
+			const lastStart = sessionB.events.map(e => e.type).lastIndexOf("agent_start");
+			const lastEnd = sessionB.events.map(e => e.type).lastIndexOf("agent_end");
+			if (lastEnd < lastStart) throw err;
+		}
+		await sessionA.waitForAgentEnd(60000, cpA1);
 		console.log(`[Scenario C] B aborted and run settled.`);
 
 		// Assert receipt does not exist prematurely before entry is verified
