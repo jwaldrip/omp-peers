@@ -1,3 +1,4 @@
+import { getSessionRef } from "./registry.js";
 import type { SessionInfo } from "./types.js";
 
 export interface TargetResolved {
@@ -33,11 +34,13 @@ export function resolveTarget(
 
   // Strip leading '@' if provided
   const cleaned = raw.startsWith("@") ? raw.slice(1).trim() : raw;
+  const cleanCurrentId = currentSessionId.replace(/-/g, "").toLowerCase();
 
   // Check exact self-target by full sessionId
   if (
     cleaned === currentSessionId ||
-    cleaned.toLowerCase() === currentSessionId.toLowerCase()
+    cleaned.toLowerCase() === currentSessionId.toLowerCase() ||
+    cleaned.replace(/-/g, "").toLowerCase() === cleanCurrentId
   ) {
     return {
       success: false,
@@ -48,53 +51,72 @@ export function resolveTarget(
 
   // Step 1: Exact sessionId match among candidates
   const exactSession = candidates.find(
-    (c) => c.sessionId.toLowerCase() === cleaned.toLowerCase()
+    (c) =>
+      c.sessionId.toLowerCase() === cleaned.toLowerCase() ||
+      c.sessionId.replace(/-/g, "").toLowerCase() === cleaned.replace(/-/g, "").toLowerCase()
   );
   if (exactSession) {
     return { success: true, session: exactSession };
   }
 
-  // Step 2: Name [id8] / @Name [id8] match
-  const bracketMatch = cleaned.match(/^(.+?)\s*\[([0-9a-fA-F]{8,})\]$/);
+  // Step 2: Name [ref] / @Name [ref] match
+  // ref matches when it equals the tail ref (last 8 hex chars), or is a prefix of full ID (hyphens ignored)
+  const bracketMatch = cleaned.match(/^(.+?)\s*\[([0-9a-fA-F-]+)\]$/);
   if (bracketMatch) {
     const targetName = bracketMatch[1].trim().toLowerCase();
-    const id8 = bracketMatch[2].toLowerCase();
+    const refRaw = bracketMatch[2].toLowerCase();
+    const cleanRef = refRaw.replace(/-/g, "");
 
-    // Check candidate matches first
-    const id8Matches = candidates.filter((c) =>
-      c.sessionId.toLowerCase().startsWith(id8)
-    );
+    const refMatches = candidates.filter((c) => {
+      const cRef = c.id8.toLowerCase();
+      const cFullClean = c.sessionId.replace(/-/g, "").toLowerCase();
+      return cRef === refRaw || cFullClean.startsWith(cleanRef);
+    });
 
-    if (id8Matches.length === 1) {
-      return { success: true, session: id8Matches[0] };
-    }
-
-    if (id8Matches.length > 1) {
-      // Disambiguate by name if possible
-      const nameAndIdMatches = id8Matches.filter(
-        (c) => c.name.toLowerCase() === targetName
-      );
-      if (nameAndIdMatches.length === 1) {
-        return { success: true, session: nameAndIdMatches[0] };
-      }
-      if (nameAndIdMatches.length > 1) {
-        const list = nameAndIdMatches.map(formatAmbiguousCandidate).join("\n  ");
+    if (refMatches.length === 1) {
+      if (refMatches[0].sessionId.toLowerCase() === currentSessionId.toLowerCase()) {
         return {
           success: false,
-          error: `Ambiguous target "${cleaned}". Matches ${nameAndIdMatches.length} sessions with same name and ID prefix:\n  ${list}`,
+          error: `Self-target is not allowed. Cannot send message to current session (${raw}).`,
+          kind: "self",
+        };
+      }
+      return { success: true, session: refMatches[0] };
+    }
+
+    if (refMatches.length > 1) {
+      const nameAndRefMatches = refMatches.filter(
+        (c) => c.name.toLowerCase() === targetName
+      );
+      if (nameAndRefMatches.length === 1) {
+        if (nameAndRefMatches[0].sessionId.toLowerCase() === currentSessionId.toLowerCase()) {
+          return {
+            success: false,
+            error: `Self-target is not allowed. Cannot send message to current session (${raw}).`,
+            kind: "self",
+          };
+        }
+        return { success: true, session: nameAndRefMatches[0] };
+      }
+      if (nameAndRefMatches.length > 1) {
+        const list = nameAndRefMatches.map(formatAmbiguousCandidate).join("\n  ");
+        return {
+          success: false,
+          error: `Ambiguous target "${cleaned}". Matches ${nameAndRefMatches.length} sessions:\n  ${list}`,
           kind: "ambiguous",
         };
       }
-      const list = id8Matches.map(formatAmbiguousCandidate).join("\n  ");
+      const list = refMatches.map(formatAmbiguousCandidate).join("\n  ");
       return {
         success: false,
-        error: `Ambiguous target "${cleaned}". ID prefix matches multiple sessions:\n  ${list}`,
+        error: `Ambiguous target "${cleaned}". Matches ${refMatches.length} sessions:\n  ${list}`,
         kind: "ambiguous",
       };
     }
 
-    // No candidates matched the id8; check if it was self
-    if (currentSessionId.toLowerCase().startsWith(id8)) {
+    // Check if target was current session
+    const currentRef = getSessionRef(currentSessionId).toLowerCase();
+    if (currentRef === refRaw || cleanCurrentId.startsWith(cleanRef) || cleanCurrentId.endsWith(cleanRef)) {
       return {
         success: false,
         error: `Self-target is not allowed. Cannot send message to current session (${raw}).`,
@@ -103,19 +125,24 @@ export function resolveTarget(
     }
   }
 
-  // Step 3: Unique sessionId prefix (>= 4 chars hex)
-  if (cleaned.length >= 4 && /^[0-9a-fA-F-]+$/.test(cleaned)) {
-    const prefixMatches = candidates.filter((c) =>
-      c.sessionId.toLowerCase().startsWith(cleaned.toLowerCase())
-    );
+  // Step 3: Unique sessionId prefix or tail ref (>= 4 chars hex, hyphens ignored)
+  const cleanTarget = cleaned.replace(/-/g, "");
+  if (cleanTarget.length >= 4 && /^[0-9a-fA-F]+$/.test(cleanTarget)) {
+    const targetMatches = candidates.filter((c) => {
+      const cFullClean = c.sessionId.replace(/-/g, "").toLowerCase();
+      const cRef = c.id8.toLowerCase();
+      return cRef === cleanTarget.toLowerCase() || cFullClean.startsWith(cleanTarget.toLowerCase());
+    });
 
-    const matchesSelf = currentSessionId.toLowerCase().startsWith(cleaned.toLowerCase());
+    const matchesSelf =
+      cleanCurrentId.startsWith(cleanTarget.toLowerCase()) ||
+      cleanCurrentId.endsWith(cleanTarget.toLowerCase());
 
-    if (prefixMatches.length === 1 && !matchesSelf) {
-      return { success: true, session: prefixMatches[0] };
+    if (targetMatches.length === 1 && !matchesSelf) {
+      return { success: true, session: targetMatches[0] };
     }
 
-    if (prefixMatches.length === 0 && matchesSelf) {
+    if (targetMatches.length === 0 && matchesSelf) {
       return {
         success: false,
         error: `Self-target is not allowed. Cannot send message to current session (${raw}).`,
@@ -123,11 +150,11 @@ export function resolveTarget(
       };
     }
 
-    if (prefixMatches.length > 0) {
-      const list = prefixMatches.map(formatAmbiguousCandidate).join("\n  ");
+    if (targetMatches.length > 1) {
+      const list = targetMatches.map(formatAmbiguousCandidate).join("\n  ");
       return {
         success: false,
-        error: `Ambiguous session ID prefix "${cleaned}". Matches ${prefixMatches.length} sessions:\n  ${list}`,
+        error: `Ambiguous session identifier "${cleaned}". Matches ${targetMatches.length} sessions:\n  ${list}`,
         kind: "ambiguous",
       };
     }
@@ -182,7 +209,7 @@ export function resolveTarget(
     };
   }
 
-  // Not found: list up to 5 live suggestions as Name [id8]
+  // Not found: list up to 5 live suggestions as Name [ref]
   const suggestions = liveCandidates.slice(0, 5).map((c) => `${c.name} [${c.id8}]`);
   let suggestionsText = "No live sessions currently registered.";
   if (suggestions.length > 0) {

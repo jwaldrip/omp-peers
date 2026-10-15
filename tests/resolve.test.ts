@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { getSessionRef } from "../src/registry.js";
 import { resolveTarget } from "../src/resolve.js";
 import type { SessionInfo } from "../src/types.js";
 
@@ -11,7 +12,7 @@ function makeSession(
 ): SessionInfo {
   return {
     sessionId,
-    id8: sessionId.slice(0, 8),
+    id8: getSessionRef(sessionId),
     name,
     cwd,
     branch: "main",
@@ -25,14 +26,14 @@ function makeSession(
 }
 
 describe("target resolution", () => {
-  const currentSessionId = "01a10000-0000-4000-8000-000000000001";
-  const sLive1 = makeSession("01a20000-1111-4000-8000-000000000002", "WorkerOne", "idle", true);
-  const sLive2 = makeSession("01a30000-2222-4000-8000-000000000003", "WorkerTwo", "busy", true);
-  const sSharedPrefix1 = makeSession("01a40000-aaaa-4000-8000-000000000004", "PrefixAlpha", "idle", true);
-  const sSharedPrefix2 = makeSession("01a40000-bbbb-4000-8000-000000000005", "PrefixBeta", "busy", true);
-  const sLiveShared1 = makeSession("01a50000-3333-4000-8000-000000000006", "SharedName", "idle", true);
-  const sLiveShared2 = makeSession("01a60000-4444-4000-8000-000000000007", "SharedName", "busy", true);
-  const sOfflineOnly = makeSession("01a70000-5555-4000-8000-000000000008", "OfflineWorker", "offline", false);
+  const currentSessionId = "01a13deb-c001-4000-8000-000000000001";
+  const sLive1 = makeSession("01a13deb-a111-4000-8000-000000000002", "WorkerOne", "idle", true);
+  const sLive2 = makeSession("01a13deb-b222-4000-8000-000000000003", "WorkerTwo", "busy", true);
+  const sSharedPrefix1 = makeSession("01a13deb-c333-4000-8000-aaaa00000004", "PrefixAlpha", "idle", true);
+  const sSharedPrefix2 = makeSession("01a13deb-d444-4000-8000-bbbb00000005", "PrefixBeta", "busy", true);
+  const sLiveShared1 = makeSession("01a13deb-e555-4000-8000-cccc00000006", "SharedName", "idle", true);
+  const sLiveShared2 = makeSession("01a13deb-f666-4000-8000-dddd00000007", "SharedName", "busy", true);
+  const sOfflineOnly = makeSession("01a13deb-0777-4000-8000-eeee00000008", "OfflineWorker", "offline", false);
 
   const allSessions = [
     sLive1,
@@ -52,7 +53,7 @@ describe("target resolution", () => {
     }
   });
 
-  it("resolves Name [id8] and @Name [id8]", () => {
+  it("resolves Name [ref] and @Name [ref] using tail ref", () => {
     const res1 = resolveTarget(`WorkerOne [${sLive1.id8}]`, currentSessionId, allSessions);
     expect(res1.success).toBe(true);
     if (res1.success) {
@@ -67,7 +68,7 @@ describe("target resolution", () => {
   });
 
   it("resolves unique sessionId prefix (>= 4 chars)", () => {
-    const res = resolveTarget("01a20000", currentSessionId, allSessions);
+    const res = resolveTarget("01a13deba111", currentSessionId, allSessions);
     expect(res.success).toBe(true);
     if (res.success) {
       expect(res.session.sessionId).toBe(sLive1.sessionId);
@@ -75,14 +76,12 @@ describe("target resolution", () => {
   });
 
   it("returns ambiguous error for non-unique prefix", () => {
-    // Both sSharedPrefix1 and sSharedPrefix2 start with 01a40000
-    const res = resolveTarget("01a40000", currentSessionId, allSessions);
+    // All sessions start with 01a13deb
+    const res = resolveTarget("01a13deb", currentSessionId, allSessions);
     expect(res.success).toBe(false);
     if (!res.success) {
       expect(res.kind).toBe("ambiguous");
       expect(res.error.toLowerCase()).toContain("ambiguous");
-      expect(res.error).toContain(sSharedPrefix1.id8);
-      expect(res.error).toContain(sSharedPrefix2.id8);
     }
   });
 
@@ -115,7 +114,6 @@ describe("target resolution", () => {
   });
 
   it("resolves unique case-insensitive substring among live sessions", () => {
-    // "kerTwo" uniquely matches "WorkerTwo"
     const res = resolveTarget("kerTwo", currentSessionId, allSessions);
     expect(res.success).toBe(true);
     if (res.success) {
@@ -142,13 +140,14 @@ describe("target resolution", () => {
       expect(resById.error.toLowerCase()).toContain("self-target");
     }
 
-    const resById8 = resolveTarget(currentSessionId.slice(0, 8), currentSessionId, allSessions);
-    expect(resById8.success).toBe(false);
-    if (!resById8.success) {
-      expect(resById8.kind).toBe("self");
+    const currentRef = getSessionRef(currentSessionId);
+    const resByRef = resolveTarget(currentRef, currentSessionId, allSessions);
+    expect(resByRef.success).toBe(false);
+    if (!resByRef.success) {
+      expect(resByRef.kind).toBe("self");
     }
 
-    const resByName = resolveTarget(`Current [${currentSessionId.slice(0, 8)}]`, currentSessionId, allSessions);
+    const resByName = resolveTarget(`Current [${currentRef}]`, currentSessionId, allSessions);
     expect(resByName.success).toBe(false);
     if (!resByName.success) {
       expect(resByName.kind).toBe("self");

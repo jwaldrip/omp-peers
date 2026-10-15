@@ -16,6 +16,7 @@ import {
 } from "./mailbox.js";
 import {
   formatSessionLine,
+  getSessionRef,
   listSessions,
   markOfflineSync,
   writeRegistryEntry,
@@ -24,7 +25,7 @@ import { resolveTarget } from "./resolve.js";
 import type { RegistryEntry, SendPiMessageDetails } from "./types.js";
 
 export function isSubagentSession(ctx: ExtensionContext): boolean {
-  // Check 1: session file inside parent session's artifacts directory
+  // Session-file-location check: subagent session files live inside parent session artifacts directory
   const sessionFile = ctx.sessionManager?.getSessionFile?.();
   if (sessionFile) {
     const parentSessionFile = `${path.dirname(sessionFile)}.jsonl`;
@@ -36,25 +37,13 @@ export function isSubagentSession(ctx: ExtensionContext): boolean {
       // Ignore fs check failure
     }
   }
-
-  // Check 2: system prompt contains subagent marker
-  const systemPrompt = ctx.getSystemPrompt?.() || [];
-  for (const part of systemPrompt) {
-    if (
-      part.includes("assigned to you by the main agent") ||
-      part.includes("Yield protocol:") ||
-      part.includes("§ Coop")
-    ) {
-      return true;
-    }
-  }
-
   return false;
 }
 
 export default function ompPeersExtension(pi: ExtensionAPI): void {
   const root = getPeersDir();
   let currentSessionId = "";
+  let sessionStartedAt = Date.now();
   let deliveryMachine: DeliveryStateMachine | null = null;
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let lastRegisteredName = "";
@@ -64,7 +53,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     if (isSubagent || !currentSessionId) return;
     const isIdle = forceStatus ? forceStatus === "idle" : ctx.isIdle();
     const status = forceStatus ?? (isIdle ? "idle" : "busy");
-    const name = pi.getSessionName() || `${path.basename(ctx.cwd)}-${currentSessionId.slice(0, 8)}`;
+    const name = pi.getSessionName() || `${path.basename(ctx.cwd)}-${getSessionRef(currentSessionId)}`;
     lastRegisteredName = name;
 
     const entry: RegistryEntry = {
@@ -73,7 +62,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       name,
       cwd: ctx.cwd,
       pid: process.pid,
-      startedAt: Date.now(),
+      startedAt: sessionStartedAt,
       heartbeatAt: Date.now(),
       status,
     };
@@ -97,25 +86,8 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     }
 
     currentSessionId = ctx.sessionManager.getSessionId();
+    sessionStartedAt = Date.now();
     trace(root, "session_start", { sessionId: currentSessionId, cwd: ctx.cwd });
-
-    // Materialize session file on disk so --resume always finds it even if stopped immediately
-    const sessionFile = ctx.sessionManager?.getSessionFile?.();
-    if (sessionFile && !fs.existsSync(sessionFile)) {
-      const header = ctx.sessionManager?.getHeader?.() || {
-        type: "session",
-        version: 3,
-        id: currentSessionId,
-        timestamp: new Date().toISOString(),
-        cwd: path.resolve(ctx.cwd),
-      };
-      try {
-        fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-        fs.writeFileSync(sessionFile, JSON.stringify(header) + "\n", { mode: 0o600 });
-      } catch {
-        // Ignore file write error
-      }
-    }
 
     await updateHeartbeat(ctx);
 
@@ -202,6 +174,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     }
 
     currentSessionId = ctx.sessionManager.getSessionId();
+    sessionStartedAt = Date.now();
     await updateHeartbeat(ctx);
 
     const host = {
@@ -227,6 +200,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     }
 
     currentSessionId = ctx.sessionManager.getSessionId();
+    sessionStartedAt = Date.now();
     await updateHeartbeat(ctx);
 
     const host = {
@@ -322,11 +296,11 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       body?: string;
     } | undefined;
     const name = details?.from?.name ?? "peer";
-    const id8 = (details?.from?.sessionId ?? "").slice(0, 8);
+    const ref = getSessionRef(details?.from?.sessionId ?? "");
     const body = details?.body ?? (typeof message.content === "string" ? message.content : "");
     const firstLine = body.split("\n")[0] ?? "";
     const summary = details?.summary || firstLine;
-    const header = `peer ${name} [${id8}]: ${summary}`;
+    const header = `peer ${name} [${ref}]: ${summary}`;
 
     if (!options.expanded) {
       return {
@@ -385,7 +359,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   // Register send_pi_message tool
   const sendPiMessageSchema = pi.typebox.Type.Object({
     target: pi.typebox.Type.String({
-      description: "Recipient sessionId, Name [id8], @Name [id8], unique prefix, or name",
+      description: "Recipient sessionId, Name [ref], @Name [ref], unique prefix, or name",
     }),
     message: pi.typebox.Type.String({
       description: "Message content (maximum 64 KiB UTF-8)",
@@ -443,7 +417,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       const senderName =
         lastRegisteredName ||
         pi.getSessionName() ||
-        `${path.basename(ctx.cwd)}-${activeSessionId.slice(0, 8)}`;
+        `${path.basename(ctx.cwd)}-${getSessionRef(activeSessionId)}`;
 
       const envelope = {
         v: 1 as const,
@@ -553,8 +527,6 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
 
       if (ctx.hasUI && ctx.ui?.notify) {
         ctx.ui.notify(lines.join("\n"));
-      } else {
-        process.stdout.write(lines.join("\n") + "\n");
       }
     },
   });

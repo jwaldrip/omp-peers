@@ -108,7 +108,6 @@ describe("lifecycle and subagent exclusion", () => {
         getSessionFile: () => subtaskFile,
         getSessionId: () => "subagent-1",
       },
-      getSystemPrompt: () => ["normal prompt"],
     } as unknown as ExtensionContext;
 
     expect(isSubagentSession(mockSubagentContext)).toBe(true);
@@ -118,36 +117,10 @@ describe("lifecycle and subagent exclusion", () => {
         getSessionFile: () => parentSessionFile,
         getSessionId: () => "parent",
       },
-      getSystemPrompt: () => ["normal prompt"],
     } as unknown as ExtensionContext;
 
     expect(isSubagentSession(mockParentContext)).toBe(false);
 
     fs.rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  it("subagent exclusion: identifies subagent by prompt coop marker", () => {
-    const mockContextWithMarker = {
-      sessionManager: {
-        getSessionFile: () => undefined,
-        getSessionId: () => "in-memory-subagent",
-      },
-      getSystemPrompt: () => [
-        "§ Role\nYou are a worker.",
-        "§ Coop\nYou are operating on a piece of work assigned to you by the main agent.",
-      ],
-    } as unknown as ExtensionContext;
-
-    expect(isSubagentSession(mockContextWithMarker)).toBe(true);
-
-    const mockNormalContext = {
-      sessionManager: {
-        getSessionFile: () => undefined,
-        getSessionId: () => "interactive-top-level",
-      },
-      getSystemPrompt: () => ["You are a helpful coding assistant."],
-    } as unknown as ExtensionContext;
-
-    expect(isSubagentSession(mockNormalContext)).toBe(false);
   });
 });

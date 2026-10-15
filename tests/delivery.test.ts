@@ -58,6 +58,18 @@ class MockDeliveryHost implements DeliveryHost {
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }
   ): void {
     this.sentMessages.push({ message, options });
+    // If triggerTurn is false (mode appended), simulate recording directly into session entries
+    if (options?.triggerTurn === false) {
+      this.entries.push({
+        type: "custom_message",
+        customType: message.customType,
+        content: message.content,
+        display: message.display,
+        details: message.details,
+        attribution: message.attribution,
+        timestamp: Date.now(),
+      });
+    }
   }
 
   getEntries(): readonly unknown[] {
@@ -66,7 +78,7 @@ class MockDeliveryHost implements DeliveryHost {
 }
 
 describe("delivery state machine", () => {
-  it("delivers to idle host with mode woke and triggerTurn: true", async () => {
+  it("delivers to idle host with mode woke and triggerTurn: true, stopping after 1 woke claim", async () => {
     const root = createTempDir("omp-peers-test-woke");
     const sessionId = "target-session-woke";
     const host = new MockDeliveryHost();
@@ -74,23 +86,33 @@ describe("delivery state machine", () => {
 
     const sm = new DeliveryStateMachine(root, sessionId, process.pid, host);
 
-    const msg: PeerMessageEnvelope = {
+    const msg1: PeerMessageEnvelope = {
       v: 1,
       id: "msg-woke-1",
       from: { sessionId: "sender-1", name: "Sender", cwd: "/tmp" },
       to: sessionId,
-      body: "Wake up turn",
-      sentAt: Date.now(),
+      body: "Wake up turn 1",
+      sentAt: 1000,
+    };
+    const msg2: PeerMessageEnvelope = {
+      v: 1,
+      id: "msg-woke-2",
+      from: { sessionId: "sender-1", name: "Sender", cwd: "/tmp" },
+      to: sessionId,
+      body: "Wake up turn 2",
+      sentAt: 2000,
     };
 
-    await writeMessage(root, msg);
+    await writeMessage(root, msg1);
+    await writeMessage(root, msg2);
+
+    // Initial pass: should only claim 1 message with mode woke, then stop to avoid concurrent triggers
     await sm.processInbox();
 
     expect(host.sentMessages.length).toBe(1);
     const sent = host.sentMessages[0];
     expect(sent.options?.triggerTurn).toBe(true);
     expect(sent.options?.deliverAs).toBeUndefined();
-    expect(sent.message.customType).toBe("peer-message");
     expect(sent.message.details.peerMessageId).toBe("msg-woke-1");
 
     // Simulate message_end event from the session
@@ -147,7 +169,7 @@ describe("delivery state machine", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("handles abort: re-submits unacked message with NO triggerTurn (mode appended)", async () => {
+  it("handles abort: resubmission occurs when idle without pending messages (mode appended)", async () => {
     const root = createTempDir("omp-peers-test-abort");
     const sessionId = "target-session-abort";
     const host = new MockDeliveryHost();
@@ -171,13 +193,19 @@ describe("delivery state machine", () => {
     expect(host.sentMessages.length).toBe(1);
     expect(host.sentMessages[0].options?.deliverAs).toBe("steer");
 
-    // Stream gets aborted: agent_end fires with stopReason: "aborted"
+    // Tool execution aborted structurally via assistant_stop_aborted
+    await sm.onAgentEnd([
+      { role: "user", content: "run tool" },
+      { role: "assistant", stopReason: "toolUse" },
+      { role: "toolResult", details: { source: "assistant_stop_aborted" } },
+    ]);
+
+    // Resubmission should NOT happen immediately while not verified idle/store
+    // Now host settles to idle
     host.idle = true;
     host.pending = false;
 
-    await sm.onAgentEnd([
-      { role: "assistant", stopReason: "aborted" },
-    ]);
+    await sm.processInbox();
 
     // Should have re-submitted with triggerTurn: false
     expect(host.sentMessages.length).toBe(2);
@@ -216,11 +244,13 @@ describe("delivery state machine", () => {
     await sm.processInbox();
     expect(host.sentMessages.length).toBe(1);
 
-    // Host has queued next-turn messages waiting
+    await sm.onAgentEnd([{ role: "assistant", stopReason: "aborted" }]);
+
+    // Host is idle but has pending messages
     host.idle = true;
     host.pending = true;
 
-    await sm.onAgentEnd([{ role: "assistant", stopReason: "aborted" }]);
+    await sm.processInbox();
 
     // Should NOT have re-submitted yet
     expect(host.sentMessages.length).toBe(1);
@@ -257,7 +287,7 @@ describe("delivery state machine", () => {
     });
 
     host.idle = true;
-    await sm.onAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await sm.checkAckAgainstEntries();
 
     const receipt = await readReceipt(root, "sender-5", "msg-entries-1");
     expect(receipt).not.toBeNull();

@@ -9,6 +9,11 @@ import {
 } from "./mailbox.js";
 import type { RegistryEntry, SessionInfo } from "./types.js";
 
+export function getSessionRef(sessionId: string): string {
+  const unhyphenated = sessionId.replace(/-/g, "");
+  return unhyphenated.slice(-8);
+}
+
 export function resolveGitBranch(cwd: string): string {
   try {
     const gitPath = path.join(cwd, ".git");
@@ -202,7 +207,7 @@ export async function listSessions(
 
       results.push({
         sessionId: entry.sessionId,
-        id8: entry.sessionId.slice(0, 8),
+        id8: getSessionRef(entry.sessionId),
         name: entry.name,
         cwd: entry.cwd,
         branch,

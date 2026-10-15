@@ -11,7 +11,7 @@ export interface RegistryEntry {
 
 export interface SessionInfo {
   sessionId: string;
-  id8: string;
+  id8: string; // 8-char tail ref (last 8 hex chars of unhyphenated sessionId)
   name: string;
   cwd: string;
   branch: string;
