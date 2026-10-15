@@ -11,7 +11,7 @@
  *   c. abort: B runs long sleep; A sends nonce1; B aborted via RPC; nonce1 in session file;
  *             no turn in 10s; A sends nonce2 while idle -> B starts turn
  *   d. offline: B stopped; A sends -> queued_offline; B resumed -> nonce delivered on start
- *   e. naming: B1 & B2 same title -> ambiguous error; Name [id8] delivers; unknown -> not_found suggestions
+ *   e. naming: B1 & B2 same title -> ambiguous error; Name [ref] delivers; unknown -> not_found suggestions
  *
  * Usage:
  *   bun scripts/prove-live.ts [--extension <path>] [--model <model>] [--omp <path>] [--self-test] [-v]
@@ -28,6 +28,11 @@ function delay(ms: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	setTimeout(resolve, ms);
 	return promise;
+}
+
+export function getSessionRef(sessionId: string): string {
+	const unhyphenated = sessionId.replace(/-/g, "");
+	return unhyphenated.slice(-8);
 }
 
 // ============================================================================
@@ -202,7 +207,11 @@ export class OmpRpcSession {
 	}
 
 	get id8(): string {
-		return this.sessionId.slice(0, 8);
+		return getSessionRef(this.sessionId);
+	}
+
+	get ref(): string {
+		return getSessionRef(this.sessionId);
 	}
 
 	markEventCheckpoint(): number {
@@ -279,7 +288,7 @@ export class OmpRpcSession {
 		}
 
 		if (this.verbose) {
-			console.log(`[${this.label}] Ready. SessionId: ${this.sessionId} (${this.id8}), Name: "${this.sessionName}"`);
+			console.log(`[${this.label}] Ready. SessionId: ${this.sessionId} (ref: ${this.ref}), Name: "${this.sessionName}"`);
 		}
 	}
 
@@ -654,7 +663,7 @@ async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		});
 
 		const nonce = `NONCE_${randomUUID().slice(0, 8)}`;
-		console.log(`[Scenario A] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (${sessionB.id8})`);
+		console.log(`[Scenario A] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (ref: ${sessionB.ref})`);
 
 		// Set up listeners on B before prompting A
 		const cpB = sessionB.markEventCheckpoint();
@@ -726,7 +735,7 @@ async function runScenarioB(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		});
 
 		const nonce = `NONCE_BUSY_${randomUUID().slice(0, 8)}`;
-		console.log(`[Scenario B] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (${sessionB.id8})`);
+		console.log(`[Scenario B] Nonce: ${nonce}. Session B: ${sessionB.sessionId} (ref: ${sessionB.ref})`);
 
 		// Prompt B to run sleep 15
 		console.log(`[Scenario B] Prompting B to run sleep 15...`);
@@ -822,8 +831,9 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const cpA1 = sessionA.markEventCheckpoint();
 		const aToolEndPromise1 = sessionA.waitForToolEnd("send_pi_message", 60000, cpA1);
 		await sessionA.prompt(`Call tool send_pi_message immediately with {"target": "${sessionB.sessionId}", "message": "${nonce1}"}. Do not call any other tool.`);
-		await aToolEndPromise1;
-		console.log(`[Scenario C] Nonce1 accepted by extension.`);
+		const aToolEnd1 = await aToolEndPromise1;
+		const message1Id = aToolEnd1.result?.details?.messageId;
+		console.log(`[Scenario C] Nonce1 sent (messageId: ${message1Id}).`);
 
 		// Give a brief moment for extension to process the inbox file before aborting
 		await delay(600);
@@ -837,10 +847,30 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		await sessionB.waitForAgentEnd(25000, cpBAbort);
 		console.log(`[Scenario C] B aborted and run settled.`);
 
-		// 5. Check B's session file on disk for persisted custom_message entry
-		console.log(`[Scenario C] Polling B's session file on disk for persisted custom message...`);
+		// Assert receipt does not exist prematurely before entry is verified
+		if (message1Id) {
+			const receiptPath = path.join(env.peersDir, "receipts", sessionA.sessionId, `${message1Id}.json`);
+			const prematureReceipt = fs.existsSync(receiptPath);
+			if (prematureReceipt) {
+				const receiptData = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+				if (receiptData.status === "delivered" && receiptData.mode === "appended") {
+					// Check if entry already persisted
+					const entries = sessionB.readSessionEntries();
+					const exists = entries.some(e => {
+						const isMsg = (e.type === "custom_message" && e.customType === "peer-message") || (e.type === "custom" && e.customType === "peer-message");
+						return isMsg && (typeof e.content === "string" ? e.content : JSON.stringify(e.content ?? "")).includes(nonce1);
+					});
+					if (!exists) {
+						throw new Error(`Receipt for ${nonce1} was created BEFORE entry was written to B's session file!`);
+					}
+				}
+			}
+		}
+
+		// 5. Poll up to 15s for the custom_message entry in B's session file
+		console.log(`[Scenario C] Polling B's session file on disk for persisted custom message (up to 15s)...`);
 		let customEntry: Record<string, unknown> | undefined;
-		const pollDeadline = Date.now() + 6000;
+		const pollDeadline = Date.now() + 15000;
 		while (Date.now() < pollDeadline) {
 			const entries = sessionB.readSessionEntries();
 			customEntry = entries.find(e => {
@@ -855,12 +885,12 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 				return false;
 			});
 			if (customEntry) break;
-			await delay(200);
+			await delay(250);
 		}
 
 		if (!customEntry) {
 			const entries = sessionB.readSessionEntries();
-			throw new Error(`nonce1 (${nonce1}) was NOT found persisted as custom_message entry in B's session file (${sessionB.sessionFile}). Found ${entries.length} entries.`);
+			throw new Error(`nonce1 (${nonce1}) was NOT found persisted as custom_message entry in B's session file (${sessionB.sessionFile}) after 15s. Found ${entries.length} entries.`);
 		}
 		console.log(`[Scenario C] Verified nonce1 is persisted in B's session entries.`);
 
@@ -912,6 +942,7 @@ async function runScenarioC(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 
 /**
  * Scenario d: Offline
+ * Give B an initial completed turn so omp persists the session naturally.
  * Stop B's process.
  * A sends nonce3 and gets queued_offline.
  * Restart B with --resume <B session id> (same session dir, same OMP_PEERS_DIR).
@@ -942,13 +973,19 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const bSessionId = sessionB.sessionId;
 		const bCwd = sessionB.cwd;
 		const nonce3 = `NONCE_OFFLINE_${randomUUID().slice(0, 8)}`;
-		console.log(`[Scenario D] Nonce3: ${nonce3}. Stopping session B (${bSessionId})...`);
+		console.log(`[Scenario D] Nonce3: ${nonce3}. Giving B an initial completed turn to persist naturally...`);
 
-		// 1. Stop B
+		// 1. Initial turn so omp creates and persists the session naturally
+		const cpInit = sessionB.markEventCheckpoint();
+		const initEnd = sessionB.waitForAgentEnd(60000, cpInit);
+		await sessionB.prompt("Reply with OK");
+		await initEnd;
+
+		// 2. Stop B
 		await sessionB.stop();
 		console.log(`[Scenario D] Session B stopped.`);
 
-		// 2. A sends nonce3 to B's sessionId
+		// 3. A sends nonce3 to B's sessionId
 		console.log(`[Scenario D] Prompting A to send to offline B (${bSessionId})...`);
 		const cpA = sessionA.markEventCheckpoint();
 		const aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000, cpA);
@@ -972,7 +1009,7 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 			throw new Error(`Expected at least one pending message file in ${inboxDir}`);
 		}
 
-		// 3. Restart B with --resume
+		// 4. Restart B with --resume
 		console.log(`[Scenario D] Restarting B with --resume ${bSessionId}...`);
 		const resumedB = await env.createSession({
 			label: "B_resumed",
@@ -1004,8 +1041,8 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 /**
  * Scenario e: Naming
  * Two live sessions with the same title -> send_pi_message by that name returns
- * an ambiguous error listing both as Name [id8].
- * Sending to one Name [id8] succeeds.
+ * an ambiguous error listing both as Name [ref].
+ * Sending to one Name [ref] succeeds.
  * An unknown target returns not_found with suggestions.
  */
 async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<ScenarioResult> {
@@ -1043,8 +1080,35 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		await b1.setSessionName(sharedTitle);
 		await b2.setSessionName(sharedTitle);
 
-		// Wait briefly for registry write
-		await delay(600);
+		// Poll both sessions' registry files until both carry the shared title
+		console.log(`[Scenario E] Polling registry files until both carry "${sharedTitle}"...`);
+		const b1RegPath = path.join(env.peersDir, "registry", `${b1.sessionId}.json`);
+		const b2RegPath = path.join(env.peersDir, "registry", `${b2.sessionId}.json`);
+		const registryDeadline = Date.now() + 15000;
+		while (Date.now() < registryDeadline) {
+			let b1Ok = false;
+			let b2Ok = false;
+			try {
+				if (fs.existsSync(b1RegPath)) {
+					const d1 = JSON.parse(fs.readFileSync(b1RegPath, "utf8")) as { name?: string };
+					if (d1.name === sharedTitle) b1Ok = true;
+				}
+				if (fs.existsSync(b2RegPath)) {
+					const d2 = JSON.parse(fs.readFileSync(b2RegPath, "utf8")) as { name?: string };
+					if (d2.name === sharedTitle) b2Ok = true;
+				}
+			} catch {}
+			if (b1Ok && b2Ok) break;
+			await delay(250);
+		}
+
+		const b1Ref = `${sharedTitle} [${b1.ref}]`;
+		const b2Ref = `${sharedTitle} [${b2.ref}]`;
+		console.log(`[Scenario E] B1 ref: ${b1Ref}, B2 ref: ${b2Ref}`);
+
+		if (b1.ref === b2.ref) {
+			throw new Error(`B1 ref and B2 ref collided: ${b1.ref}`);
+		}
 
 		// 1. Ambiguous send
 		console.log(`[Scenario E] Testing ambiguous target "${sharedTitle}"...`);
@@ -1056,20 +1120,18 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		let text = JSON.stringify(aToolEnd.result?.content || "");
 		console.log(`[Scenario E] Ambiguous result content: ${text}`);
 
-		const b1Ref = `${sharedTitle} [${b1.id8}]`;
-		const b2Ref = `${sharedTitle} [${b2.id8}]`;
-
-		if (!text.toLowerCase().includes("ambiguous") || !text.includes(b1.id8) || !text.includes(b2.id8)) {
+		if (!text.toLowerCase().includes("ambiguous") || !text.includes(b1.ref) || !text.includes(b2.ref)) {
 			throw new Error(`Expected ambiguous error listing both ${b1Ref} and ${b2Ref}, got: ${text}`);
 		}
-		console.log(`[Scenario E] Verified ambiguous error listing both candidates.`);
+		console.log(`[Scenario E] Verified ambiguous error listing both distinct candidate refs.`);
 		await sessionA.waitForAgentEnd(60000, cpA);
 
-		// 2. Specific Name [id8] send
+		// 2. Specific Name [ref] send targeting B1
 		console.log(`[Scenario E] Testing resolved target "${b1Ref}"...`);
 		const nonceB1 = `NONCE_B1_${randomUUID().slice(0, 8)}`;
 		const cpB1 = b1.markEventCheckpoint();
 		const b1MessagePromise = b1.waitForPeerMessage(nonceB1, 60000, cpB1);
+		const cpB2 = b2.markEventCheckpoint();
 
 		cpA = sessionA.markEventCheckpoint();
 		aToolEndPromise = sessionA.waitForToolEnd("send_pi_message", 60000, cpA);
@@ -1084,6 +1146,19 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		}
 		await b1MessagePromise;
 		console.log(`[Scenario E] Verified delivery to specific target ${b1Ref}.`);
+
+		// Assert B2 did NOT receive nonceB1
+		const b2Received = b2.events.slice(cpB2).some(e => {
+			if (e.type === "message_end" && e.message?.customType === "peer-message") {
+				const content = typeof e.message.content === "string" ? e.message.content : JSON.stringify(e.message.content || "");
+				return content.includes(nonceB1);
+			}
+			return false;
+		});
+		if (b2Received) {
+			throw new Error(`B2 received message intended for B1!`);
+		}
+		console.log(`[Scenario E] Verified B2 did not receive B1 message.`);
 		await sessionA.waitForAgentEnd(60000, cpA);
 
 		// 3. Unknown target send
@@ -1102,7 +1177,7 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		console.log(`[Scenario E] Verified not_found error returned with suggestions.`);
 		await sessionA.waitForAgentEnd(60000, cpA);
 
-		const evidence = `Ambiguous error listed both ${b1Ref} and ${b2Ref}; exact target ${b1Ref} delivered; unknown target gave not_found`;
+		const evidence = `Ambiguous error listed both ${b1Ref} and ${b2Ref}; exact target ${b1Ref} delivered (B2 untouched); unknown target gave not_found`;
 		console.log(`[Scenario E] PASS: ${evidence}`);
 
 		return { id, name, status: "PASS", evidence };
