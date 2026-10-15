@@ -336,6 +336,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     name: "list_pi",
     label: "List Pi Sessions",
     description: "List other active or offline OMP sessions on this machine.",
+    loadMode: "essential",
     parameters: listPiSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       if (isSubagentSession(ctx)) {
@@ -380,6 +381,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     name: "send_pi_message",
     label: "Send Pi Message",
     description: "Send a message to another OMP session on this machine.",
+    loadMode: "essential",
     parameters: sendPiMessageSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       if (isSubagentSession(ctx)) {
