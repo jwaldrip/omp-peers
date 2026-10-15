@@ -77,5 +77,5 @@ export interface DeliveryHost {
     },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }
   ): void;
-  getEntries(): any[];
+  getEntries(): readonly unknown[];
 }
