@@ -1,0 +1,22 @@
+{
+  "name": "omp-peers",
+  "version": "0.1.0",
+  "description": "Native peer messaging extension for oh-my-pi sessions",
+  "type": "module",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prove": "bun scripts/prove-live.ts"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.11.0",
+    "@types/bun": "^1.2.4",
+    "typescript": "^5.8.2"
+  }
+}
