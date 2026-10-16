@@ -22,3 +22,17 @@ The driver creates isolated mailbox/session directories and loads only the speci
 | Name collision | Duplicate titles produce distinct references; an exact reference reaches only its intended recipient. |
 
 `delivered` means confirmed in the on-disk transcript. At-least-once retries can duplicate uncertain wakes; the driver does not prove exactly-once action execution. Contract tests separately cover claim ownership, disk confirmation, replay, malformed records, lifecycle fences, and width-safe rendering.
+
+After linking the plugin, exercise normal global extension discovery with the same isolated mailbox and sessions:
+
+```bash
+bun scripts/prove-live.ts --omp ./scripts/installed-entry.sh --extension ./src/index.ts
+```
+
+The entrypoint removes the driver's explicit-extension flags and executes the installed `/opt/homebrew/bin/omp`. This checks what a newly started session discovers from the global plugin installation.
+
+For same-process switching and restart suppression of already-recorded messages:
+
+```bash
+bun scripts/prove-recovery.ts --extension ./src/index.ts
+```
