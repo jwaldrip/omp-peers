@@ -208,7 +208,10 @@ export async function claimOldestMessage(
       raw = JSON.parse(fs.readFileSync(target, "utf8"));
     } catch (error) {
       if (error instanceof SyntaxError) quarantine(root, target, "malformed message JSON");
-      else trace(root, "message_read_failed", { source: target, error: String(error) });
+      else {
+        trace(root, "message_read_failed", { source: target, error: String(error) });
+        try { fs.renameSync(target, source); } catch {}
+      }
       continue;
     }
     const recovered = parseClaimRecord(raw, sessionId);
@@ -221,7 +224,12 @@ export async function claimOldestMessage(
       ? { ...recovered, owner, phase: recovered.phase === "accepted" ? "pending" : recovered.phase,
           aborted: recovered.aborted || recovered.phase === "accepted" }
       : { v: 1, envelope: parsed, phase: "pending", owner, attempts: [], aborted: false };
-    writeAtomicFileSync(target, JSON.stringify(record));
+    try {
+      writeAtomicFileSync(target, JSON.stringify(record));
+    } catch (error) {
+      try { fs.renameSync(target, source); } catch {}
+      throw error;
+    }
     trace(root, "message_claimed", { messageId: parsed.id, sessionId, instanceId: owner.instanceId });
     return { record, claimedPath: target };
   }
@@ -411,6 +419,12 @@ export async function pruneMailbox(root: string): Promise<void> {
       try { files = await fs.promises.readdir(path.join(base, dir)); } catch { continue; }
       for (const file of files) {
         const source = path.join(base, dir, file);
+        if (group === "delivered") {
+          try {
+            const archive = parseClaimRecord(JSON.parse(await fs.promises.readFile(source, "utf8")));
+            if (!archive || !await readReceipt(root, archive.envelope.from.sessionId, archive.envelope.id)) continue;
+          } catch { continue; }
+        }
         try { if ((await fs.promises.stat(source)).mtimeMs < oldest) await fs.promises.unlink(source); } catch {}
       }
     }

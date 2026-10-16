@@ -74,7 +74,7 @@ export interface DeliveryReceipt {
 }
 
 export interface SendPiMessageDetails {
-  status: "delivered" | "accepted" | "unconfirmed" | "uncertain" | "queued" | "queued_offline";
+  status: "delivered" | "queued" | "queued_offline";
   mode?: DeliveryMode;
   messageId: string;
   recipient: {

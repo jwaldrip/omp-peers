@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@o
 import listPiDescription from "./prompts/list-pi.md" with { type: "text" };
 import sendPiMessageDescription from "./prompts/send-pi-message.md" with { type: "text" };
 import { DeliveryStateMachine } from "./delivery.js";
-import { getPeersDir, retireOwnerSync, trace, waitForReceipt, writeMessage } from "./mailbox.js";
+import { getPeersDir, pruneMailbox, retireOwnerSync, trace, waitForReceipt, writeMessage } from "./mailbox.js";
 import { formatSessionLine, getSessionRef, listSessions, markOfflineSync, writeRegistryEntry } from "./registry.js";
 import { resolveTarget } from "./resolve.js";
 import { installPeerAutocomplete, registerPeerRenderer } from "./ui.js";
@@ -89,6 +89,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     clearInterval(reactivationTimer);
     reactivationTimer = undefined;
     await updateHeartbeat(ctx);
+    void pruneMailbox(root).catch((error) => trace(root, "cleanup_unavailable", { error: String(error) }));
     if (!next.active || binding !== next || ctx.sessionManager.getSessionId() !== sessionId) return;
     const host = {
       isIdle: () => ctx.isIdle(),
@@ -149,7 +150,12 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   pi.on("turn_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
   pi.on("agent_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
   pi.on("turn_end", async (_event, ctx) => { await updateHeartbeat(ctx); void deliveryMachine?.processInbox(); });
-  pi.on("agent_end", async (event, ctx) => { await updateHeartbeat(ctx); await deliveryMachine?.onAgentEnd(event.messages); void deliveryMachine?.processInbox(); });
+  pi.on("agent_end", async (event, ctx) => {
+    const machine = deliveryMachine;
+    await updateHeartbeat(ctx);
+    await machine?.onAgentEnd(event.messages);
+    void machine?.processInbox();
+  });
   pi.on("message_end", async (event) => { await deliveryMachine?.onMessageEnd(event as Parameters<DeliveryStateMachine["onMessageEnd"]>[0]); });
 
   pi.on("context", (event, ctx) => {

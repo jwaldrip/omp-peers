@@ -160,8 +160,10 @@ export class DeliveryStateMachine {
 
   async onAgentEnd(messages: readonly unknown[]): Promise<{ isAborted: boolean }> {
     const aborted = isRunAborted(messages);
+    if (!this.#canDeliver()) return { isAborted: aborted };
     if (aborted) {
       for (const tracked of this.#tracked.values()) {
+        if (!this.#canDeliver()) break;
         if (tracked.record.phase !== "submitted") continue;
         tracked.record.aborted = true;
         try { await writeClaimRecord(tracked.claimedPath, tracked.record); } catch (error) {

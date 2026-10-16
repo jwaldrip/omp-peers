@@ -23,6 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import proofSystemPrompt from "./fixtures/proof-system.md" with { type: "text" };
 
 function delay(ms: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -145,10 +146,7 @@ function parseCliArgs(): CliOptions {
 	}
 
 	if (!options.extensionPath && !options.selfTest) {
-		const defaultExt = path.resolve(
-			process.env.HOME || "",
-			"dev/src/github.com/jwaldrip/omp-peers.worktrees/durable-peer-mailbox/src/index.ts",
-		);
+		const defaultExt = path.resolve(import.meta.dir, "../src/index.ts");
 		if (fs.existsSync(defaultExt)) {
 			options.extensionPath = defaultExt;
 		}
@@ -231,7 +229,7 @@ export class OmpRpcSession {
 			"--no-skills",
 			"--no-rules",
 			`--config=${this.configPath}`,
-			"--system-prompt=You are an automated test agent. Follow instructions concisely without explanation.",
+			`--system-prompt=${proofSystemPrompt}`,
 			"--no-title",
 			...(resumeSessionId ? [`--resume=${resumeSessionId}`] : []),
 		];
@@ -634,11 +632,35 @@ export function extractToolStatus(result?: RpcToolResult): string | undefined {
 	return undefined;
 }
 
+async function confirmDiskReceipt(
+	env: ProofEnvironment, sender: OmpRpcSession, recipient: OmpRpcSession, messageId: string | undefined,
+): Promise<void> {
+	if (!messageId) throw new Error("The send result omitted its message ID");
+	const receiptPath = path.join(env.peersDir, "receipts", sender.sessionId, `${messageId}.json`);
+	const deadline = Date.now() + 90000;
+	while (Date.now() < deadline) {
+		if (fs.existsSync(receiptPath)) {
+			const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
+			const persisted = recipient.readSessionEntries().some((entry) => {
+				const details = entry.details as Record<string, unknown> | undefined;
+				return entry.type === "custom_message" && entry.customType === "peer-message" &&
+					details?.peerMessageId === messageId && details?.toSessionId === recipient.sessionId;
+			});
+			if (!persisted || receipt.id !== messageId || receipt.to !== recipient.sessionId || receipt.status !== "delivered") {
+				throw new Error("Delivery receipt lacks its matching persisted recipient message");
+			}
+			return;
+		}
+		await delay(100);
+	}
+	throw new Error(`No disk-confirmed receipt for ${messageId}`);
+}
+
 /**
  * Scenario a: Idle wake
  * Session A's model is prompted to call send_pi_message to B with a nonce.
  * B emits a peer-message message_end containing the nonce and starts a turn.
- * A's tool result status is "delivered".
+ * A may initially report queued; a delivered receipt must eventually match B's on-disk transcript.
  */
 async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<ScenarioResult> {
 	const id = "a";
@@ -683,15 +705,16 @@ async function runScenarioA(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const status = extractToolStatus(toolResult);
 
 		console.log(`[Scenario A] A's send_pi_message status: "${status}"`);
-		if (status !== "delivered") {
-			throw new Error(`Expected A's tool result status to be "delivered", got "${status}" (details: ${JSON.stringify(toolResult?.details)}, content: ${JSON.stringify(toolResult?.content)})`);
+		if (status !== "delivered" && status !== "queued") {
+			throw new Error(`Expected an accepted send, got "${status}"`);
 		}
 
 		console.log(`[Scenario A] Waiting for B to receive message and start turn...`);
 		await bMessagePromise;
 		await bTurnPromise;
+		await confirmDiskReceipt(env, sessionA, sessionB, toolResult?.details?.messageId);
 
-		const evidence = `A tool status=delivered; B emitted peer-message message_end with ${nonce} and started turn`;
+		const evidence = `A tool status=${status}; B received ${nonce}, started a turn, and confirmed it on disk`;
 		console.log(`[Scenario A] PASS: ${evidence}`);
 
 		// Wait for both to settle turns
@@ -1156,10 +1179,11 @@ async function runScenarioE(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		const b1Status = extractToolStatus(aToolEnd.result);
 		console.log(`[Scenario E] Send to ${b1Ref} status: "${b1Status}"`);
 
-		if (b1Status !== "delivered") {
-			throw new Error(`Expected delivered status for ${b1Ref}, got: ${b1Status} (result: ${JSON.stringify(aToolEnd.result)})`);
+		if (b1Status !== "delivered" && b1Status !== "queued") {
+			throw new Error(`Expected an accepted send to ${b1Ref}, got: ${b1Status}`);
 		}
 		await b1MessagePromise;
+		await confirmDiskReceipt(env, sessionA, b1, aToolEnd.result?.details?.messageId);
 		console.log(`[Scenario E] Verified delivery to specific target ${b1Ref}.`);
 
 		// Assert B2 did NOT receive nonceB1
@@ -1303,11 +1327,11 @@ async function main() {
 
 		const results: ScenarioResult[] = [];
 
-		results.push(await runScenarioA(env, opts));
-		results.push(await runScenarioB(env, opts));
-		results.push(await runScenarioC(env, opts));
-		results.push(await runScenarioD(env, opts));
-		results.push(await runScenarioE(env, opts));
+		for (const scenario of [runScenarioA, runScenarioB, runScenarioC, runScenarioD, runScenarioE]) {
+			results.push(await scenario(env, opts));
+			for (const session of env.activeSessions) await session.stop();
+			env.activeSessions.length = 0;
+		}
 
 		console.log("\n====================================================================================================");
 		console.log("FINAL RESULTS TABLE");
