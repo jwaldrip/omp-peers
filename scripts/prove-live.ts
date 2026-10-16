@@ -1062,7 +1062,10 @@ async function runScenarioD(env: ProofEnvironment, opts: CliOptions): Promise<Sc
 		// so scan from the first event rather than from a checkpoint taken afterwards.
 		const cpResumed = 0;
 		await resumedB.waitForPeerMessage(nonce3, 60000, cpResumed);
-		await resumedB.waitForEvent(e => e.type === "agent_start", 60000, cpResumed);
+		// The installed startup path can emit turn_start without an agent_start frame.
+		// Require observed turn activity, the actual peer message, and its disk receipt.
+		await resumedB.waitForEvent(e => e.type === "agent_start" || e.type === "turn_start", 60000, cpResumed);
+		await confirmDiskReceipt(env, sessionA, resumedB, toolResult?.details?.messageId);
 
 		const evidence = `A status=queued_offline; message persisted in inbox; resumed B delivered ${nonce3} and started turn`;
 		console.log(`[Scenario D] PASS: ${evidence}`);
