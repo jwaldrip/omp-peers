@@ -1,9 +1,16 @@
+export interface ClaimOwner {
+  instanceId: string;
+  pid: number;
+  generation: number;
+}
+
 export interface RegistryEntry {
   v: 1;
   sessionId: string;
   name: string;
   cwd: string;
   pid: number;
+  instanceId: string;
   startedAt: number;
   heartbeatAt: number;
   status: "idle" | "busy" | "offline";
@@ -11,7 +18,7 @@ export interface RegistryEntry {
 
 export interface SessionInfo {
   sessionId: string;
-  id8: string; // 8-char tail ref (last 8 hex chars of unhyphenated sessionId)
+  id8: string;
   name: string;
   cwd: string;
   branch: string;
@@ -38,17 +45,37 @@ export interface PeerMessageEnvelope {
   sentAt: number;
 }
 
+export type DeliveryMode = "woke" | "steered" | "appended";
+export type DeliveryPhase = "pending" | "submitted" | "accepted";
+
+export interface DeliveryAttempt {
+  id: string;
+  mode: DeliveryMode;
+  submittedAt: number;
+  retryAfter: number;
+}
+
+export interface ClaimedMessageRecord {
+  v: 1;
+  envelope: PeerMessageEnvelope;
+  phase: DeliveryPhase;
+  owner: ClaimOwner;
+  attempts: DeliveryAttempt[];
+  aborted: boolean;
+}
+
 export interface DeliveryReceipt {
+  v: 1;
   id: string;
   to: string;
   status: "delivered";
-  mode: "woke" | "steered" | "appended";
+  mode: DeliveryMode;
   deliveredAt: number;
 }
 
 export interface SendPiMessageDetails {
-  status: "delivered" | "queued" | "queued_offline";
-  mode?: "woke" | "steered" | "appended";
+  status: "delivered" | "accepted" | "unconfirmed" | "uncertain" | "queued" | "queued_offline";
+  mode?: DeliveryMode;
   messageId: string;
   recipient: {
     sessionId: string;
@@ -58,21 +85,26 @@ export interface SendPiMessageDetails {
   };
 }
 
+export interface PeerPayloadDetails {
+  peerMessageId: string;
+  toSessionId: string;
+  from: { sessionId: string; name: string; cwd: string };
+  summary?: string;
+  body: string;
+  sentAt: number;
+}
+
 export interface DeliveryHost {
   isIdle(): boolean;
   hasPendingMessages(): boolean;
+  getSessionId(): string;
+  getSessionFile(): string | undefined;
   sendMessage(
     message: {
       customType: string;
       content: string;
       display: boolean;
-      details: {
-        peerMessageId: string;
-        from: { sessionId: string; name: string; cwd: string };
-        summary?: string;
-        body: string;
-        sentAt: number;
-      };
+      details: PeerPayloadDetails;
       attribution: "agent";
     },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }

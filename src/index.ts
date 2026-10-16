@@ -1,523 +1,209 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
-} from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import listPiDescription from "./prompts/list-pi.md" with { type: "text" };
 import sendPiMessageDescription from "./prompts/send-pi-message.md" with { type: "text" };
 import { DeliveryStateMachine } from "./delivery.js";
-import {
-  getPeersDir,
-  writeMessage,
-  waitForReceipt,
-  trace,
-} from "./mailbox.js";
-import {
-  formatSessionLine,
-  getSessionRef,
-  listSessions,
-  markOfflineSync,
-  writeRegistryEntry,
-} from "./registry.js";
+import { getPeersDir, retireOwnerSync, trace, waitForReceipt, writeMessage } from "./mailbox.js";
+import { formatSessionLine, getSessionRef, listSessions, markOfflineSync, writeRegistryEntry } from "./registry.js";
 import { resolveTarget } from "./resolve.js";
-import type { RegistryEntry, SendPiMessageDetails } from "./types.js";
+import { installPeerAutocomplete, registerPeerRenderer } from "./ui.js";
+import type { ClaimOwner, RegistryEntry, SendPiMessageDetails } from "./types.js";
+
+interface DeliveryBinding { sessionId: string; owner: ClaimOwner; active: boolean; startedAt: number; }
 
 export function isSubagentSession(ctx: ExtensionContext): boolean {
-  // Session-file-location check: subagent session files live inside parent session artifacts directory
   const sessionFile = ctx.sessionManager?.getSessionFile?.();
-  if (sessionFile) {
-    const parentSessionFile = `${path.dirname(sessionFile)}.jsonl`;
-    try {
-      if (fs.existsSync(parentSessionFile)) {
-        return true;
-      }
-    } catch {
-      // Ignore fs check failure
-    }
-  }
-  return false;
+  if (!sessionFile) return false;
+  try { return fs.existsSync(`${path.dirname(sessionFile)}.jsonl`); } catch { return false; }
 }
-
-import * as fs from "node:fs";
 
 export default function ompPeersExtension(pi: ExtensionAPI): void {
   const root = getPeersDir();
-  let currentSessionId = "";
-  let sessionStartedAt = Date.now();
+  let binding: DeliveryBinding | null = null;
+  let generation = 0;
   let deliveryMachine: DeliveryStateMachine | null = null;
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let lastRegisteredName = "";
-  let isSubagent = false;
+  let subagent = false;
   let autocompleteInstalled = false;
+  let retiredSessionId = "";
 
-  const updateHeartbeat = async (ctx: ExtensionContext, forceStatus?: "idle" | "busy" | "offline"): Promise<void> => {
-    if (isSubagent || !currentSessionId) return;
-    const isIdle = forceStatus ? forceStatus === "idle" : ctx.isIdle();
-    const status = forceStatus ?? (isIdle ? "idle" : "busy");
-    const name = pi.getSessionName() || `${path.basename(ctx.cwd)}-${getSessionRef(currentSessionId)}`;
+  const retire = (): void => {
+    const retiring = binding;
+    generation++;
+    if (!retiring) return;
+    retiring.active = false;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+    deliveryMachine?.stop();
+    deliveryMachine = null;
+    retireOwnerSync(root, retiring.sessionId, retiring.owner);
+    markOfflineSync(root, retiring.sessionId);
+    retiredSessionId = retiring.sessionId;
+    binding = null;
+  };
+
+  const updateHeartbeat = async (ctx: ExtensionContext, force?: "idle" | "busy" | "offline"): Promise<void> => {
+    const current = binding;
+    if (subagent || !current?.active || ctx.sessionManager.getSessionId() !== current.sessionId) return;
+    const name = pi.getSessionName() || `${path.basename(ctx.cwd)}-${getSessionRef(current.sessionId)}`;
     lastRegisteredName = name;
-
     const entry: RegistryEntry = {
-      v: 1,
-      sessionId: currentSessionId,
-      name,
-      cwd: ctx.cwd,
-      pid: process.pid,
-      startedAt: sessionStartedAt,
-      heartbeatAt: Date.now(),
-      status,
+      v: 1, sessionId: current.sessionId, name, cwd: ctx.cwd, pid: process.pid,
+      instanceId: current.owner.instanceId, startedAt: current.startedAt, heartbeatAt: Date.now(),
+      status: force ?? (ctx.isIdle() ? "idle" : "busy"),
     };
-
-    try {
-      await writeRegistryEntry(root, entry);
-    } catch {
-      // Ignore heartbeat write failure
+    try { await writeRegistryEntry(root, entry); } catch (error) {
+      trace(root, "heartbeat_unavailable", { sessionId: current.sessionId, error: String(error) });
     }
   };
 
   const setupSession = async (ctx: ExtensionContext): Promise<void> => {
     if (isSubagentSession(ctx)) {
-      isSubagent = true;
+      subagent = true;
       const activeTools = pi.getActiveTools();
-      const filtered = activeTools.filter((t) => t !== "list_pi" && t !== "send_pi_message");
-      if (filtered.length !== activeTools.length) {
-        void pi.setActiveTools(filtered);
-      }
+      const filtered = activeTools.filter((tool) => tool !== "list_pi" && tool !== "send_pi_message");
+      if (filtered.length !== activeTools.length) void pi.setActiveTools(filtered);
       return;
     }
-
-    if (currentSessionId) {
-      markOfflineSync(root, currentSessionId);
-    }
-    if (deliveryMachine) {
-      deliveryMachine.stop();
-      deliveryMachine = null;
-    }
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = undefined;
-
-    currentSessionId = ctx.sessionManager.getSessionId();
-    sessionStartedAt = Date.now();
-    trace(root, "session_setup", { sessionId: currentSessionId, cwd: ctx.cwd });
-
+    subagent = false;
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (binding?.active && binding.sessionId === sessionId) return;
+    retire();
+    const next: DeliveryBinding = {
+      sessionId,
+      owner: { instanceId: randomUUID(), pid: process.pid, generation },
+      active: true,
+      startedAt: Date.now(),
+    };
+    binding = next;
+    retiredSessionId = "";
     await updateHeartbeat(ctx);
-
+    if (!next.active || binding !== next || ctx.sessionManager.getSessionId() !== sessionId) return;
     const host = {
       isIdle: () => ctx.isIdle(),
       hasPendingMessages: () => ctx.hasPendingMessages(),
-      sendMessage: (
-        payload: Parameters<ExtensionAPI["sendMessage"]>[0],
-        options?: Parameters<ExtensionAPI["sendMessage"]>[1]
-      ) => {
+      getSessionId: () => ctx.sessionManager.getSessionId(),
+      getSessionFile: () => ctx.sessionManager.getSessionFile(),
+      sendMessage: (payload: Parameters<ExtensionAPI["sendMessage"]>[0], options?: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
+        if (!next.active || binding !== next || ctx.sessionManager.getSessionId() !== next.sessionId) throw new Error("Peer delivery binding is no longer current");
         pi.sendMessage(payload, options);
       },
       getEntries: () => ctx.sessionManager.getEntries(),
     };
-
-    deliveryMachine = new DeliveryStateMachine(root, currentSessionId, process.pid, host);
-    await deliveryMachine.start();
-
-    // Heartbeat every 5s using the current session context
-    heartbeatTimer = setInterval(() => {
-      void updateHeartbeat(ctx);
-    }, 5000);
+    const machine = new DeliveryStateMachine(root, sessionId, next.owner, host, () =>
+      next.active && binding === next && ctx.sessionManager.getSessionId() === next.sessionId,
+    );
+    deliveryMachine = machine;
+    await machine.start();
+    if (!next.active || binding !== next || ctx.sessionManager.getSessionId() !== sessionId) { machine.stop(); return; }
+    heartbeatTimer = setInterval(() => { void updateHeartbeat(ctx); }, 5000);
     heartbeatTimer.unref();
-
-    // Autocomplete provider for '@'
-    if (!autocompleteInstalled && ctx.hasUI && typeof ctx.ui?.addAutocompleteProvider === "function") {
+    if (!autocompleteInstalled) {
       autocompleteInstalled = true;
-      try {
-        ctx.ui.addAutocompleteProvider((baseProvider) => {
-          // omp's own `@file` items also start with "@"; only the values offered here are ours to apply.
-          const peerValues = new Set<string>();
-          return {
-            async getSuggestions(lines, cursorLine, cursorCol) {
-              const line = lines[cursorLine] || "";
-              const textBeforeCursor = line.slice(0, cursorCol);
-              const atMatch = textBeforeCursor.match(/@(\S*)$/);
-              const baseResult = await baseProvider.getSuggestions(lines, cursorLine, cursorCol);
-
-              if (!atMatch) {
-                return baseResult;
-              }
-
-              const query = atMatch[1].toLowerCase();
-              const sessions = await listSessions(root, currentSessionId, false);
-              const matched = sessions.filter(
-                (s) =>
-                  s.name.toLowerCase().includes(query) ||
-                  s.id8.toLowerCase().includes(query)
-              );
-
-              if (matched.length === 0) {
-                return baseResult;
-              }
-
-              const peerItems = matched.map((s) => ({
-                value: `@${s.name} [${s.id8}]`,
-                label: `@${s.name} [${s.id8}]`,
-                description: `${s.effectiveStatus} - ${s.cwd}`,
-              }));
-              peerValues.clear();
-              for (const item of peerItems) peerValues.add(item.value);
-
-              const baseItems = baseResult?.items ?? [];
-              return {
-                items: [...peerItems, ...baseItems],
-                prefix: atMatch[0],
-              };
-            },
-            applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-              if (peerValues.has(item.value)) {
-                const line = lines[cursorLine] || "";
-                const before = line.slice(0, cursorCol - prefix.length);
-                const after = line.slice(cursorCol);
-                const newLine = before + item.value + " " + after;
-                const newLines = [...lines];
-                newLines[cursorLine] = newLine;
-                return {
-                  lines: newLines,
-                  cursorLine,
-                  cursorCol: before.length + item.value.length + 1,
-                };
-              }
-              return baseProvider.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
-            },
-          };
-        });
-      } catch {
-        // Autocomplete setup skipped if not supported
-      }
+      installPeerAutocomplete(ctx, () => listSessions(root, binding?.sessionId ?? "", false));
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
-    await setupSession(ctx);
-  });
+  const reactivateIfCurrent = (ctx: ExtensionContext): void => {
+    if (!binding && retiredSessionId && ctx.sessionManager.getSessionId() === retiredSessionId) void setupSession(ctx);
+  };
 
-  pi.on("session_switch", async (_event, ctx) => {
-    await setupSession(ctx);
-  });
+  pi.on("session_start", async (_event, ctx) => { await setupSession(ctx); });
+  pi.on("session_before_switch", () => { if (!subagent) retire(); });
+  pi.on("session_before_branch", () => { if (!subagent) retire(); });
+  pi.on("session_switch", async (_event, ctx) => { await setupSession(ctx); });
+  pi.on("session_branch", async (_event, ctx) => { await setupSession(ctx); });
+  pi.on("session_shutdown", () => { if (!subagent) retire(); });
+  pi.on("turn_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
+  pi.on("agent_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
+  pi.on("turn_end", async (_event, ctx) => { await updateHeartbeat(ctx); void deliveryMachine?.processInbox(); });
+  pi.on("agent_end", async (event, ctx) => { await updateHeartbeat(ctx); await deliveryMachine?.onAgentEnd(event.messages); void deliveryMachine?.processInbox(); });
+  pi.on("message_end", async (event) => { await deliveryMachine?.onMessageEnd(event as Parameters<DeliveryStateMachine["onMessageEnd"]>[0]); });
 
-  pi.on("session_branch", async (_event, ctx) => {
-    await setupSession(ctx);
-  });
-
-  pi.on("turn_start", async (_event, ctx) => {
-    await updateHeartbeat(ctx, "busy");
-  });
-
-  pi.on("agent_start", async (_event, ctx) => {
-    await updateHeartbeat(ctx, "busy");
-  });
-
-  pi.on("turn_end", async (_event, ctx) => {
-    await updateHeartbeat(ctx);
-    if (deliveryMachine) {
-      void deliveryMachine.processInbox();
-    }
-  });
-
-  pi.on("agent_end", async (event, ctx) => {
-    await updateHeartbeat(ctx);
-    if (deliveryMachine) {
-      const { isAborted } = await deliveryMachine.onAgentEnd(event.messages);
-      if (!isAborted) {
-        void deliveryMachine.processInbox();
-      }
-    }
-  });
-
-  pi.on("message_end", async (event) => {
-    if (deliveryMachine) {
-      await deliveryMachine.onMessageEnd(event as Parameters<DeliveryStateMachine["onMessageEnd"]>[0]);
-    }
-  });
-
-  pi.on("session_shutdown", (_event) => {
-    if (isSubagent) return;
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = undefined;
-
-    if (deliveryMachine) {
-      deliveryMachine.stop();
-      deliveryMachine = null;
-    }
-
-    if (currentSessionId) {
-      markOfflineSync(root, currentSessionId);
-    }
-  });
-
-  // Context deduplication: drop duplicate peer-message IDs
   pi.on("context", (event) => {
-    const seenIds = new Set<string>();
+    const currentSessionId = binding?.sessionId;
+    const seen = new Set<string>();
     let modified = false;
-    const filtered: AgentMessage[] = [];
-
-    for (const msg of event.messages) {
-      if (msg.role === "custom" && msg.customType === "peer-message") {
-        const details = msg.details as { peerMessageId?: string } | undefined;
-        const peerId = details?.peerMessageId;
-        if (peerId) {
-          if (seenIds.has(peerId)) {
-            modified = true;
-            continue;
-          }
-          seenIds.add(peerId);
+    const messages: AgentMessage[] = [];
+    for (const message of event.messages) {
+      if (message.role === "custom" && message.customType === "peer-message") {
+        const details = message.details as { peerMessageId?: unknown; toSessionId?: unknown } | undefined;
+        const peerMessageId = details?.peerMessageId;
+        const intendedSessionId = details?.toSessionId;
+        if (intendedSessionId !== currentSessionId || typeof peerMessageId !== "string" || seen.has(peerMessageId)) {
+          modified = true;
+          continue;
         }
+        seen.add(peerMessageId);
       }
-      filtered.push(msg);
+      messages.push(message);
     }
-
-    if (modified) {
-      return { messages: filtered };
-    }
+    return modified ? { messages } : undefined;
   });
 
-  // Message renderer
-  pi.registerMessageRenderer("peer-message", (message, options) => {
-    const details = message.details as {
-      from?: { name?: string; sessionId?: string };
-      summary?: string;
-      body?: string;
-    } | undefined;
-    const name = details?.from?.name ?? "peer";
-    const ref = getSessionRef(details?.from?.sessionId ?? "");
-    const body = details?.body ?? (typeof message.content === "string" ? message.content : "");
-    const firstLine = body.split("\n")[0] ?? "";
-    const summary = details?.summary || firstLine;
-    const header = `peer ${name} [${ref}]: ${summary}`;
+  registerPeerRenderer(pi, () => binding?.sessionId ?? "");
 
-    if (!options.expanded) {
-      return {
-        render() {
-          return [header];
-        },
-      };
-    }
-
-    return {
-      render() {
-        return [header, ...body.split("\n")];
-      },
-    };
-  });
-
-  // Register list_pi tool
   const listPiSchema = pi.typebox.Type.Object({
-    include_offline: pi.typebox.Type.Optional(
-      pi.typebox.Type.Boolean({
-        description: "Include offline sessions active in the last 7 days",
-      })
-    ),
+    include_offline: pi.typebox.Type.Optional(pi.typebox.Type.Boolean({ description: "Include offline sessions active in the last 7 days" })),
   });
-
   pi.registerTool({
-    name: "list_pi",
-    label: "List Pi Sessions",
-    description: listPiDescription.trim(),
-    loadMode: "essential",
-    parameters: listPiSchema,
+    name: "list_pi", label: "List Pi Sessions", description: listPiDescription.trim(), loadMode: "essential", parameters: listPiSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      if (isSubagentSession(ctx)) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "Subagent sessions cannot call peer messaging tools." }],
-        };
-      }
-
-      const activeSessionId = ctx.sessionManager?.getSessionId() || currentSessionId;
-      const sessions = await listSessions(root, activeSessionId, params.include_offline === true);
-
-      if (sessions.length === 0) {
-        return {
-          content: [{ type: "text", text: "No other sessions found." }],
-        };
-      }
-
-      const lines = sessions.map(formatSessionLine);
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
+      if (isSubagentSession(ctx)) return { isError: true, content: [{ type: "text", text: "Subagent sessions cannot call peer messaging tools." }] };
+      const sessions = await listSessions(root, ctx.sessionManager.getSessionId(), params.include_offline === true);
+      return { content: [{ type: "text", text: sessions.length ? sessions.map(formatSessionLine).join("\n") : "No other sessions found." }] };
     },
   });
 
-  // Register send_pi_message tool
   const sendPiMessageSchema = pi.typebox.Type.Object({
-    target: pi.typebox.Type.String({
-      description: "Recipient sessionId, Name [ref], @Name [ref], unique prefix, or name",
-    }),
-    message: pi.typebox.Type.String({
-      description: "Message content (maximum 64 KiB UTF-8)",
-    }),
-    summary: pi.typebox.Type.Optional(
-      pi.typebox.Type.String({
-        description: "Optional one-line summary for TUI collapsed display",
-      })
-    ),
+    target: pi.typebox.Type.String({ description: "Recipient sessionId, Name [ref], @Name [ref], unique prefix, or name" }),
+    message: pi.typebox.Type.String({ description: "Message content (maximum 64 KiB UTF-8)" }),
+    summary: pi.typebox.Type.Optional(pi.typebox.Type.String({ description: "Optional one-line summary for TUI collapsed display" })),
   });
-
   pi.registerTool({
-    name: "send_pi_message",
-    label: "Send Pi Message",
-    description: sendPiMessageDescription.trim(),
-    loadMode: "essential",
-    parameters: sendPiMessageSchema,
+    name: "send_pi_message", label: "Send Pi Message", description: sendPiMessageDescription.trim(), loadMode: "essential", parameters: sendPiMessageSchema,
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      if (isSubagentSession(ctx)) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "Subagent sessions cannot call peer messaging tools." }],
-        };
-      }
-
-      const activeSessionId = ctx.sessionManager?.getSessionId() || currentSessionId;
-
-      // Message size cap: 64 KiB UTF-8
-      const byteLength = Buffer.byteLength(params.message, "utf8");
-      if (byteLength > 64 * 1024) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Message exceeds maximum allowed size of 64 KiB (size: ${byteLength} bytes).`,
-            },
-          ],
-        };
-      }
-
-      // Query candidates (including offline)
-      const candidates = await listSessions(root, activeSessionId, true);
-      const resolution = resolveTarget(params.target, activeSessionId, candidates);
-
-      if (!resolution.success) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: resolution.error }],
-        };
-      }
-
+      if (isSubagentSession(ctx)) return { isError: true, content: [{ type: "text", text: "Subagent sessions cannot call peer messaging tools." }] };
+      const senderId = ctx.sessionManager.getSessionId();
+      const bytes = Buffer.byteLength(params.message, "utf8");
+      if (bytes > 64 * 1024) return { isError: true, content: [{ type: "text", text: `Message exceeds maximum allowed size of 64 KiB (size: ${bytes} bytes).` }] };
+      const resolution = resolveTarget(params.target, senderId, await listSessions(root, senderId, true));
+      if (!resolution.success) return { isError: true, content: [{ type: "text", text: resolution.error }] };
       const recipient = resolution.session;
-      const messageId = randomUUID();
-      const senderName =
-        lastRegisteredName ||
-        pi.getSessionName() ||
-        `${path.basename(ctx.cwd)}-${getSessionRef(activeSessionId)}`;
-
       const envelope = {
-        v: 1 as const,
-        id: messageId,
-        from: {
-          sessionId: activeSessionId,
-          name: senderName,
-          cwd: ctx.cwd,
-        },
-        to: recipient.sessionId,
-        summary: params.summary,
-        body: params.message,
-        sentAt: Date.now(),
+        v: 1 as const, id: randomUUID(),
+        from: { sessionId: senderId, name: lastRegisteredName || pi.getSessionName() || `${path.basename(ctx.cwd)}-${getSessionRef(senderId)}`, cwd: ctx.cwd },
+        to: recipient.sessionId, summary: params.summary, body: params.message, sentAt: Date.now(),
       };
-
-      // Write durably to recipient's inbox
       await writeMessage(root, envelope);
-
-      let status: "delivered" | "queued" | "queued_offline" = "queued";
-      let mode: "woke" | "steered" | "appended" | undefined;
-      let responseText = "";
-
-      if (recipient.isLive) {
-        // Wait up to 3s for receipt
-        const receipt = await waitForReceipt(root, activeSessionId, messageId, 3000);
-        if (receipt) {
-          status = "delivered";
-          mode = receipt.mode;
-          if (mode === "woke") {
-            responseText = `Delivered to ${recipient.name} [${recipient.id8}]; started a turn.`;
-          } else if (mode === "steered") {
-            responseText = `Delivered to ${recipient.name} [${recipient.id8}]; injected into its running turn.`;
-          } else {
-            responseText = `Delivered to ${recipient.name} [${recipient.id8}]; appended.`;
-          }
-        } else {
-          status = "queued";
-          responseText = `${recipient.name} [${recipient.id8}] is busy; stored durably and will be injected at its next step boundary.`;
-        }
-      } else {
-        status = "queued_offline";
-        responseText = `${recipient.name} [${recipient.id8}] is not running; stored durably and delivered when that session resumes.`;
-      }
-
-      const details: SendPiMessageDetails = {
-        status,
-        mode,
-        messageId,
-        recipient: {
-          sessionId: recipient.sessionId,
-          name: recipient.name,
-          cwd: recipient.cwd,
-          live: recipient.isLive,
-        },
-      };
-
-      return {
-        content: [{ type: "text", text: responseText }],
-        details,
-      };
+      const receipt = recipient.isLive ? await waitForReceipt(root, senderId, envelope.id, 3000) : null;
+      const status: SendPiMessageDetails["status"] = receipt ? "delivered" : recipient.isLive ? "unconfirmed" : "queued_offline";
+      const details: SendPiMessageDetails = { status, mode: receipt?.mode, messageId: envelope.id, recipient: { sessionId: recipient.sessionId, name: recipient.name, cwd: recipient.cwd, live: recipient.isLive } };
+      const text = receipt
+        ? `Delivered to ${recipient.name} [${recipient.id8}]; confirmed in its persisted transcript.`
+        : recipient.isLive
+          ? `${recipient.name} [${recipient.id8}] accepted the durable envelope or delivery remains unconfirmed. At-least-once wake retries may duplicate a rare wake.`
+          : `${recipient.name} [${recipient.id8}] is offline; the envelope is queued for its next persistent session.`;
+      return { content: [{ type: "text", text }], details };
     },
   });
 
-  // Register /peers slash command
   pi.registerCommand("peers", {
     description: "Display registered OMP peers and local mailbox status",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const activeSessionId = ctx.sessionManager?.getSessionId() || currentSessionId;
-      const sessions = await listSessions(root, activeSessionId, true);
-
-      const inboxDir = path.join(root, "inbox", activeSessionId);
-      let pendingCount = 0;
-      let claimedCount = 0;
-
-      try {
-        const inboxFiles = await fs.promises.readdir(inboxDir);
-        pendingCount = inboxFiles.filter((f) => f.endsWith(".json") && !f.startsWith(".")).length;
-      } catch {}
-
-      try {
-        const claimedBase = path.join(inboxDir, "claimed");
-        const pids = await fs.promises.readdir(claimedBase);
-        for (const p of pids) {
-          const files = await fs.promises.readdir(path.join(claimedBase, p));
-          claimedCount += files.filter((f) => f.endsWith(".json")).length;
-        }
-      } catch {}
-
-      const inFlightCount = deliveryMachine?.getInFlightCount() ?? 0;
-
-      const lines: string[] = [
-        "OMP Peers status:",
-        `  Current session: ${activeSessionId}`,
-        `  Mailbox directory: ${root}`,
-        `  Inbox state: ${pendingCount} pending, ${claimedCount} claimed, ${inFlightCount} in-flight`,
-        "",
-        "Registered sessions:",
-      ];
-
-      if (sessions.length === 0) {
-        lines.push("  (no other sessions found)");
-      } else {
-        for (const s of sessions) {
-          lines.push(`  ${formatSessionLine(s)}`);
-        }
-      }
-
-      if (ctx.hasUI && ctx.ui?.notify) {
-        ctx.ui.notify(lines.join("\n"));
-      }
+      const currentSessionId = ctx.sessionManager.getSessionId();
+      const sessions = await listSessions(root, currentSessionId, true);
+      const message = [
+        "OMP Peers status:", `  Current session: ${currentSessionId}`, `  Mailbox directory: ${root}`,
+        "  Delivery is at-least-once. Delivered means confirmed in the recipient transcript.",
+        "  Ephemeral sessions without a persisted transcript cannot provide durable resume proof.", "", "Registered sessions:",
+        ...(sessions.length ? sessions.map((session) => `  ${formatSessionLine(session)}`) : ["  (no other sessions found)"]),
+      ].join("\n");
+      ctx.ui?.notify?.(message);
     },
   });
 }
