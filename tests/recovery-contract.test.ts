@@ -9,13 +9,13 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ClaimOwner, DeliveryHost, PeerMessageEnvelope, PeerPayloadDetails } from "../src/types.js";
 
 type LifecycleHandler = (event: unknown, context: ExtensionContext) => unknown;
-interface LifecycleHarness { current: { sessionId: string }; handlers: Map<string, LifecycleHandler>; api: ExtensionAPI; context: ExtensionContext; sent: PeerPayloadDetails[]; }
+interface LifecycleHarness { current: { sessionId: string }; handlers: Map<string, LifecycleHandler>; api: ExtensionAPI; context: ExtensionContext; sent: PeerPayloadDetails[]; waitForSent(count: number): Promise<void>; }
 
 function temp(prefix: string): string { return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`)); }
 function envelope(id: string, to: string, sentAt = Date.now()): PeerMessageEnvelope { return { v: 1, id, from: { sessionId: "sender-session", name: "Sender", cwd: "/tmp/sender" }, to, body: `body:${id}`, sentAt }; }
 function transcript(file: string, sessionId: string, messageId?: string): void {
   const entries: unknown[] = [{ type: "session", id: sessionId }];
-  if (messageId) entries.push({ type: "custom_message", message: { customType: "peer-message", details: { peerMessageId: messageId, toSessionId: sessionId } } });
+  if (messageId) entries.push({ type: "custom_message", customType: "peer-message", details: { peerMessageId: messageId, toSessionId: sessionId } });
   fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }
 
@@ -35,21 +35,29 @@ function machine(root: string, sessionId: string, host: Host, instanceId = "reco
   return new DeliveryStateMachine(root, sessionId, claimOwner, host, () => host.getSessionId() === sessionId);
 }
 
-async function eventually(root: string, assertion: () => void): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 300; attempt++) {
-    try { assertion(); return; } catch (error) { lastError = error; await fs.promises.readdir(root); }
-  }
-  throw lastError;
-}
 
 function lifecycleHarness(initialSessionId: string, root: string): LifecycleHarness {
   const current = { sessionId: initialSessionId };
   const handlers = new Map<string, LifecycleHandler>();
   const sent: PeerPayloadDetails[] = [];
+  const sentWaiters = new Map<number, () => void>();
+  const waitForSent = (count: number): Promise<void> => {
+    if (sent.length >= count) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    sentWaiters.set(count, resolve);
+    return promise;
+  };
   const files = new Map<string, string>();
   const api = {
-    on(event: string, handler: LifecycleHandler): void { handlers.set(event, handler); }, getSessionName(): string { return "recovery test"; }, getActiveTools(): string[] { return []; }, setActiveTools(): Promise<void> { return Promise.resolve(); }, sendMessage(message: { details: PeerPayloadDetails }): void { sent.push(message.details); }, registerMessageRenderer(): void {}, registerTool(): void {}, registerCommand(): void {},
+    on(event: string, handler: LifecycleHandler): void { handlers.set(event, handler); }, getSessionName(): string { return "recovery test"; }, getActiveTools(): string[] { return []; }, setActiveTools(): Promise<void> { return Promise.resolve(); },
+    sendMessage(message: { details: PeerPayloadDetails }): void {
+      sent.push(message.details);
+      for (const [count, resolve] of sentWaiters) if (sent.length >= count) {
+        sentWaiters.delete(count);
+        resolve();
+      }
+    },
+    registerMessageRenderer(): void {}, registerTool(): void {}, registerCommand(): void {},
     typebox: { Type: { Object: (): object => ({}), Optional: (): object => ({}), Boolean: (): object => ({}), String: (): object => ({}) } },
   } as unknown as ExtensionAPI;
   const context = {
@@ -60,7 +68,7 @@ function lifecycleHarness(initialSessionId: string, root: string): LifecycleHarn
       getEntries: (): unknown[] => [],
     },
   } as unknown as ExtensionContext;
-  return { current, handlers, api, context, sent };
+  return { current, handlers, api, context, sent, waitForSent };
 }
 
 async function invoke(harness: LifecycleHarness, event: string): Promise<void> { const handler = harness.handlers.get(event); if (!handler) throw new Error(`Missing ${event} lifecycle handler`); await handler({}, harness.context); }
@@ -68,17 +76,22 @@ async function invoke(harness: LifecycleHarness, event: string): Promise<void> {
 describe("recovery contracts", () => {
   it("releases an unacknowledged same-PID claim on switch and redelivers only after returning to its original session", async () => {
     const root = temp("omp-peers-lifecycle-switch"); const oldRoot = process.env.OMP_PEERS_DIR; process.env.OMP_PEERS_DIR = root;
+    const harness = lifecycleHarness("session-original", root);
     try {
-      const harness = lifecycleHarness("session-original", root); ompPeersExtension(harness.api); await invoke(harness, "session_start");
+      ompPeersExtension(harness.api); await invoke(harness, "session_start");
       await writeMessage(root, envelope("switch-back-message", "session-original"));
       await invoke(harness, "turn_end");
-      await eventually(root, () => expect(harness.sent).toHaveLength(1));
+      await harness.waitForSent(1);
       await invoke(harness, "session_before_switch"); harness.current.sessionId = "session-other"; await invoke(harness, "session_switch"); expect(harness.sent).toHaveLength(1);
       await invoke(harness, "session_before_switch"); harness.current.sessionId = "session-original"; await invoke(harness, "session_switch");
       await invoke(harness, "turn_end");
-      await eventually(root, () => expect(harness.sent.length).toBeGreaterThan(1));
+      await harness.waitForSent(2);
       expect(harness.sent.every((details) => details.toSessionId === "session-original")).toBe(true);
-    } finally { process.env.OMP_PEERS_DIR = oldRoot; fs.rmSync(root, { recursive: true, force: true }); }
+    } finally {
+      await invoke(harness, "session_shutdown");
+      if (oldRoot === undefined) delete process.env.OMP_PEERS_DIR; else process.env.OMP_PEERS_DIR = oldRoot;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("fences a suspended filesystem claim when the host session changes", async () => {

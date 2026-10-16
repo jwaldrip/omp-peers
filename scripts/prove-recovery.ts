@@ -13,6 +13,8 @@ interface Options {
   verbose: boolean;
 }
 
+interface RecordedDelivery { sessionId: string; sessionFile: string; envelope: PeerMessageEnvelope; }
+
 function optionsFromArgs(): Options {
   const options: Options = {
     extensionPath: path.resolve(import.meta.dir, "../src/index.ts"),
@@ -46,25 +48,6 @@ function peerEnvelope(id: string, to: string, nonce: string): PeerMessageEnvelop
   };
 }
 
-function appendPersistedPeerMessage(sessionFile: string, sessionId: string, messageId: string, envelope: PeerMessageEnvelope): void {
-  const existing = fs.readFileSync(sessionFile, "utf8");
-  const hasHeader = existing.split("\n").some((line) => {
-    try {
-      const parsed = JSON.parse(line) as { type?: unknown; id?: unknown };
-      return (parsed.type === "session" || parsed.type === "session_header") && parsed.id === sessionId;
-    } catch {
-      return false;
-    }
-  });
-  if (!hasHeader) throw new Error(`Session file has no header for ${sessionId}: ${sessionFile}`);
-  fs.appendFileSync(sessionFile, `${JSON.stringify({
-    type: "custom_message",
-    message: {
-      customType: "peer-message",
-      details: { peerMessageId: messageId, toSessionId: sessionId, from: envelope.from, body: envelope.body, sentAt: envelope.sentAt },
-    },
-  })}\n`);
-}
 
 function peerEvents(session: OmpRpcSession, nonce: string): number {
   return session.events.filter((event) => {
@@ -91,26 +74,29 @@ async function switchAwayAndBack(session: OmpRpcSession): Promise<{ sessionId: s
   return { sessionId: returned.sessionId, sessionFile: originalFile };
 }
 
-async function verifySwitchDelivery(env: ProofEnvironment, session: OmpRpcSession): Promise<{ sessionId: string; sessionFile: string }> {
+async function verifySwitchDelivery(env: ProofEnvironment, session: OmpRpcSession): Promise<RecordedDelivery> {
   const original = await switchAwayAndBack(session);
   const nonce = `recovery-switch-${randomUUID()}`;
   const messageId = `recovery-switch-${randomUUID()}`;
   const checkpoint = session.markEventCheckpoint();
-  await writeMessage(env.peersDir, peerEnvelope(messageId, original.sessionId, nonce));
+  const envelope = peerEnvelope(messageId, original.sessionId, nonce);
+  await writeMessage(env.peersDir, envelope);
   await session.waitForPeerMessage(nonce, 60_000, checkpoint);
   const receipt = await waitForReceipt(env.peersDir, "recovery-proof-sender", messageId, 60_000);
   if (!receipt || receipt.id !== messageId) throw new Error(`No receipt after same-process switch recovery for ${messageId}`);
   console.log(`OBSERVED switch-back delivery: session=${original.sessionId} nonce=${nonce} receipt=${receipt.status}/${receipt.mode}`);
-  return original;
+  return { ...original, envelope };
 }
 
-async function verifyRestartDoesNotWake(env: ProofEnvironment, session: OmpRpcSession, original: { sessionId: string; sessionFile: string }, opts: Options): Promise<void> {
+async function verifyRestartDoesNotWake(env: ProofEnvironment, session: OmpRpcSession, original: RecordedDelivery, opts: Options): Promise<void> {
   await session.stop();
-  const nonce = `recovery-restart-${randomUUID()}`;
-  const messageId = `recovery-restart-${randomUUID()}`;
-  const envelope = peerEnvelope(messageId, original.sessionId, nonce);
+  // Recreate only the mailbox side of a crash-after-transcript-before-receipt window.
+  // The transcript entry was written by real OMP during the preceding delivery.
+  const { envelope } = original;
+  const nonce = envelope.body;
+  const messageId = envelope.id;
+  fs.rmSync(path.join(env.peersDir, "receipts", envelope.from.sessionId, `${messageId}.json`), { force: true });
   await writeMessage(env.peersDir, envelope);
-  appendPersistedPeerMessage(original.sessionFile, original.sessionId, messageId, envelope);
   const resumed = await env.createSession({
     label: "recovery-resumed",
     cwd: session.cwd,

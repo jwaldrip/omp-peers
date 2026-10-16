@@ -5,10 +5,8 @@ export type TranscriptPresence = "present" | "absent" | "unavailable";
 function isMatchingPeerMessage(value: unknown, peerMessageId: string, toSessionId: string): boolean {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  const message = record.message && typeof record.message === "object"
-    ? record.message as Record<string, unknown>
-    : record;
-  if ((message.role !== "custom" && record.type !== "custom_message") || message.customType !== "peer-message") return false;
+  const message = record;
+  if (record.type !== "custom_message" || message.customType !== "peer-message") return false;
   const details = message.details;
   if (!details || typeof details !== "object") return false;
   const data = details as Record<string, unknown>;
