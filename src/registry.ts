@@ -5,8 +5,8 @@ import {
   ensureDir,
   isPidAlive,
   isSafeId,
+  quarantine,
   trace,
-  writeAtomicFile,
   writeAtomicFileSync,
 } from "./mailbox.js";
 import type { RegistryEntry, SessionInfo } from "./types.js";
@@ -53,8 +53,7 @@ export function resolveGitBranch(cwd: string): string {
 }
 
 export async function writeRegistryEntry(root: string, entry: RegistryEntry): Promise<void> {
-  assertRegistryEntry(entry);
-  await writeAtomicFile(path.join(root, "registry", `${entry.sessionId}.json`), JSON.stringify(entry));
+  writeRegistryEntrySync(root, entry);
 }
 
 export function writeRegistryEntrySync(root: string, entry: RegistryEntry): void {
@@ -73,11 +72,12 @@ export async function markOffline(root: string, sessionId: string): Promise<void
   } catch (error) { trace(root, "registry_offline_failed", { sessionId, error: String(error) }); }
 }
 
-export function markOfflineSync(root: string, sessionId: string): void {
+export function markOfflineSync(root: string, sessionId: string, instanceId?: string): void {
   const target = path.join(root, "registry", `${sessionId}.json`);
   try {
     const entry = parseRegistryEntry(JSON.parse(fs.readFileSync(target, "utf8")), `${sessionId}.json`);
     if (!entry) throw new Error("invalid registry entry");
+    if (instanceId && entry.instanceId !== instanceId) return;
     entry.status = "offline";
     entry.heartbeatAt = Date.now();
     writeRegistryEntrySync(root, entry);
@@ -97,7 +97,7 @@ export async function gcRegistry(root: string): Promise<void> {
     const source = path.join(registry, file);
     try {
       const entry = parseRegistryEntry(JSON.parse(await fs.promises.readFile(source, "utf8")), file);
-      if (!entry) { trace(root, "registry_invalid", { source }); continue; }
+      if (!entry) { quarantine(root, source, "invalid registry entry"); continue; }
       if (isSessionLive(entry) || Date.now() - entry.heartbeatAt <= 14 * 24 * 60 * 60 * 1000) continue;
       if (await countUndeliveredMessages(root, "", entry.sessionId) === 0) await fs.promises.unlink(source);
     } catch (error) { trace(root, "registry_unavailable", { source, error: String(error) }); }
@@ -119,7 +119,8 @@ export async function listSessions(root: string, currentSessionId: string, inclu
     const source = path.join(registry, file);
     try {
       const entry = parseRegistryEntry(JSON.parse(await fs.promises.readFile(source, "utf8")), file);
-      if (!entry || entry.sessionId === currentSessionId) continue;
+      if (!entry) { quarantine(root, source, "invalid registry entry"); continue; }
+      if (entry.sessionId === currentSessionId) continue;
       const live = isSessionLive(entry);
       if (!live && (!includeOffline || Date.now() - entry.heartbeatAt > 7 * 24 * 60 * 60 * 1000)) continue;
       results.push({
@@ -136,7 +137,10 @@ export async function listSessions(root: string, currentSessionId: string, inclu
         isLive: live,
         undeliveredCount: await countUndeliveredMessages(root, currentSessionId, entry.sessionId),
       });
-    } catch (error) { trace(root, "registry_unavailable", { source, error: String(error) }); }
+    } catch (error) {
+      if (error instanceof SyntaxError) quarantine(root, source, "malformed registry JSON");
+      else trace(root, "registry_unavailable", { source, error: String(error) });
+    }
   }
   return results.sort((left, right) => left.isLive === right.isLive ? right.heartbeatAt - left.heartbeatAt : left.isLive ? -1 : 1);
 }
