@@ -1,365 +1,267 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import incomingPromptTemplate from "./prompts/incoming.md" with { type: "text" };
 import {
   claimOldestMessage,
   ensureDir,
   markDelivered,
   reclaimDeadPidClaims,
+  reclaimReleasedClaims,
   trace,
+  writeClaimRecord,
 } from "./mailbox.js";
-import type { DeliveryHost, PeerMessageEnvelope } from "./types.js";
+import { findPersistedPeerMessage } from "./transcript.js";
+import type {
+  ClaimedMessageRecord,
+  ClaimOwner,
+  DeliveryHost,
+  DeliveryMode,
+  PeerMessageEnvelope,
+} from "./types.js";
 
-export interface InFlightMessage {
-  envelope: PeerMessageEnvelope;
+const RETRY_DELAYS = [250, 500, 1000, 2000, 5000] as const;
+
+interface TrackedMessage {
+  record: ClaimedMessageRecord;
   claimedPath: string;
-  mode: "woke" | "steered" | "appended";
-  submittedAt: number;
 }
 
-export interface PendingResubmitItem {
-  envelope: PeerMessageEnvelope;
-  claimedPath: string;
-  mode: "woke" | "appended";
-  lastSentAt?: number;
+export function escapeXmlAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-export function escapeXmlAttr(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-export function renderIncomingPrompt(msg: PeerMessageEnvelope): string {
-  const sentIso = new Date(msg.sentAt).toISOString();
+export function renderIncomingPrompt(message: PeerMessageEnvelope): string {
   const values: Record<string, string> = {
-    name: escapeXmlAttr(msg.from.name),
-    sessionId: escapeXmlAttr(msg.from.sessionId),
-    cwd: escapeXmlAttr(msg.from.cwd),
-    sentIso: escapeXmlAttr(sentIso),
-    body: msg.body,
+    sender_name: escapeXmlAttr(message.from.name),
+    sender_session_id: escapeXmlAttr(message.from.sessionId),
+    sent_at: new Date(message.sentAt).toISOString(),
+    summary: message.summary ? escapeXmlAttr(message.summary) : "",
+    body: message.body,
   };
   return incomingPromptTemplate.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => values[key] ?? "");
 }
 
 export function isRunAborted(messages: readonly unknown[]): boolean {
-  for (const m of messages) {
-    if (m && typeof m === "object") {
-      const msg = m as Record<string, unknown>;
-      if (msg.role === "toolResult") {
-        const details = msg.details as Record<string, unknown> | undefined;
-        if (details?.source === "assistant_stop_aborted") {
-          return true;
-        }
-      }
-    }
+  for (const value of messages) {
+    if (!value || typeof value !== "object") continue;
+    const message = value as Record<string, unknown>;
+    if (message.stopReason === "aborted" || message.stopReason === "cancelled") return true;
   }
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m && typeof m === "object") {
-      const msg = m as Record<string, unknown>;
-      if (msg.role === "assistant") {
-        return msg.stopReason === "aborted" || msg.stopReason === "error";
-      }
-    }
-  }
-
   return false;
 }
 
 export class DeliveryStateMachine {
-  private readonly root: string;
-  private readonly sessionId: string;
-  private readonly pid: number;
-  private readonly host: DeliveryHost;
+  #root: string;
+  #sessionId: string;
+  #owner: ClaimOwner;
+  #host: DeliveryHost;
+  #isActive: () => boolean;
+  #tracked = new Map<string, TrackedMessage>();
+  #watcher: fs.FSWatcher | null = null;
+  #pollTimer: NodeJS.Timeout | undefined;
+  #processing = false;
+  #stopped = false;
 
-  private inFlight = new Map<string, InFlightMessage>();
-  private pendingResubmit = new Map<string, PendingResubmitItem>();
-
-  private watcher: fs.FSWatcher | null = null;
-  private pollTimer: NodeJS.Timeout | undefined;
-  private isProcessing = false;
-  private isStopped = false;
-
-  constructor(root: string, sessionId: string, pid: number, host: DeliveryHost) {
-    this.root = root;
-    this.sessionId = sessionId;
-    this.pid = pid;
-    this.host = host;
+  constructor(root: string, sessionId: string, owner: ClaimOwner, host: DeliveryHost, isActive: () => boolean) {
+    this.#root = root;
+    this.#sessionId = sessionId;
+    this.#owner = owner;
+    this.#host = host;
+    this.#isActive = isActive;
   }
 
-  public async start(): Promise<void> {
-    const inboxDir = path.join(this.root, "inbox", this.sessionId);
-    await ensureDir(inboxDir);
-
+  async start(): Promise<void> {
+    if (!this.#canDeliver()) return;
+    const inbox = path.join(this.#root, "inbox", this.#sessionId);
     try {
-      await reclaimDeadPidClaims(this.root, this.sessionId);
-    } catch {
-      // Ignore recovery error on startup
+      await ensureDir(inbox);
+      if (!this.#canDeliver()) return;
+      await reclaimReleasedClaims(this.#root, this.#sessionId);
+      if (!this.#canDeliver()) return;
+      await reclaimDeadPidClaims(this.#root, this.#sessionId);
+      if (!this.#canDeliver()) return;
+    } catch (error) {
+      trace(this.#root, "recovery_unavailable", { sessionId: this.#sessionId, error: String(error) });
+      return;
     }
-
     try {
-      this.watcher = fs.watch(inboxDir, () => {
-        void this.processInbox();
-      });
-    } catch {
-      // Watcher failed, rely on polling
+      this.#watcher = fs.watch(inbox, () => { void this.processInbox(); });
+    } catch (error) {
+      trace(this.#root, "watch_unavailable", { sessionId: this.#sessionId, error: String(error) });
     }
-
-    this.pollTimer = setInterval(() => {
-      void this.processInbox();
-    }, 1000);
-    this.pollTimer.unref();
-
+    this.#pollTimer = setInterval(() => { void this.processInbox(); }, 500);
+    this.#pollTimer.unref();
     void this.processInbox();
   }
 
-  public stop(): void {
-    this.isStopped = true;
-    if (this.watcher) {
-      try {
-        this.watcher.close();
-      } catch {}
-      this.watcher = null;
-    }
-    clearInterval(this.pollTimer);
-    this.pollTimer = undefined;
+  stop(): void {
+    this.#stopped = true;
+    try { this.#watcher?.close(); } catch {}
+    this.#watcher = null;
+    clearInterval(this.#pollTimer);
+    this.#pollTimer = undefined;
   }
 
-  public async processInbox(): Promise<void> {
-    if (this.isProcessing || this.isStopped) {
-      return;
-    }
-    this.isProcessing = true;
-
+  async processInbox(): Promise<void> {
+    if (this.#processing || !this.#canDeliver()) return;
+    this.#processing = true;
     try {
-      // 1. Check acks against entries
-      await this.checkAckAgainstEntries();
-
-      // 2. Handle pending resubmissions once idle and no pending messages
-      if (this.pendingResubmit.size > 0 && this.host.isIdle() && !this.host.hasPendingMessages()) {
-        const now = Date.now();
-        for (const [id, item] of Array.from(this.pendingResubmit.entries())) {
-          // Check if already in entries
-          if (this.isEntryInStore(id)) {
-            this.pendingResubmit.delete(id);
-            await markDelivered(this.root, item.envelope, item.claimedPath, item.mode);
-            continue;
-          }
-
-          const payload = {
-            customType: "peer-message",
-            content: renderIncomingPrompt(item.envelope),
-            display: true,
-            details: {
-              peerMessageId: item.envelope.id,
-              from: {
-                sessionId: item.envelope.from.sessionId,
-                name: item.envelope.from.name,
-                cwd: item.envelope.from.cwd,
-              },
-              summary: item.envelope.summary,
-              body: item.envelope.body,
-              sentAt: item.envelope.sentAt,
-            },
-            attribution: "agent" as const,
-          };
-
-          if (item.mode === "appended") {
-            // Do not re-send the same message within 10s (sendMessage is async in omp)
-            if (item.lastSentAt && now - item.lastSentAt < 10000) {
-              continue;
-            }
-            item.lastSentAt = now;
-            this.host.sendMessage(payload, { triggerTurn: false });
-
-            // If immediately visible in store, ack right away
-            if (this.isEntryInStore(id)) {
-              this.pendingResubmit.delete(id);
-              await markDelivered(this.root, item.envelope, item.claimedPath, "appended");
-            }
-          } else {
-            // mode: woke
-            this.pendingResubmit.delete(id);
-            this.inFlight.set(id, {
-              envelope: item.envelope,
-              claimedPath: item.claimedPath,
-              mode: "woke",
-              submittedAt: Date.now(),
-            });
-            this.host.sendMessage(payload, { triggerTurn: true });
-            // After one woke submission, stop in this pass
-            return;
-          }
-        }
+      await this.#reconcileTracked();
+      if (!this.#canDeliver()) return;
+      await reclaimReleasedClaims(this.#root, this.#sessionId);
+      if (!this.#canDeliver()) return;
+      await reclaimDeadPidClaims(this.#root, this.#sessionId);
+      if (!this.#canDeliver()) return;
+      while (this.#canDeliver()) {
+        const claimed = await claimOldestMessage(this.#root, this.#sessionId, this.#owner);
+        if (!this.#canDeliver() || !claimed) break;
+        const tracked = { record: claimed.record, claimedPath: claimed.claimedPath };
+        this.#tracked.set(claimed.record.envelope.id, tracked);
+        await this.#reconcileOne(tracked);
+        if (!this.#canDeliver()) break;
+        if (tracked.record.phase === "pending") await this.#submit(tracked, this.#host.isIdle() ? "woke" : "steered");
+        if (!this.#canDeliver() || this.#host.isIdle()) break;
       }
-
-      // 3. Process incoming messages from disk
-      await reclaimDeadPidClaims(this.root, this.sessionId);
-
-      while (!this.isStopped) {
-        const claimed = await claimOldestMessage(this.root, this.sessionId, this.pid);
-        if (!claimed) {
-          break;
-        }
-
-        const isIdle = this.host.isIdle();
-        const mode: "woke" | "steered" = isIdle ? "woke" : "steered";
-
-        const payload = {
-          customType: "peer-message",
-          content: renderIncomingPrompt(claimed.message),
-          display: true,
-          details: {
-            peerMessageId: claimed.message.id,
-            from: {
-              sessionId: claimed.message.from.sessionId,
-              name: claimed.message.from.name,
-              cwd: claimed.message.from.cwd,
-            },
-            summary: claimed.message.summary,
-            body: claimed.message.body,
-            sentAt: claimed.message.sentAt,
-          },
-          attribution: "agent" as const,
-        };
-
-        const sendOptions = isIdle
-          ? { triggerTurn: true }
-          : { triggerTurn: true, deliverAs: "steer" as const };
-
-        this.inFlight.set(claimed.message.id, {
-          envelope: claimed.message,
-          claimedPath: claimed.claimedPath,
-          mode,
-          submittedAt: Date.now(),
-        });
-
-        trace(this.root, "submitting_message", {
-          messageId: claimed.message.id,
-          sessionId: this.sessionId,
-          mode,
-          isIdle,
-        });
-
-        this.host.sendMessage(payload, sendOptions);
-
-        await this.checkAckAgainstEntries();
-
-        if (mode === "woke") {
-          // After one woke submission, stop claiming in this pass so the recipient
-          // transitions to streaming and subsequent messages are steered
-          break;
-        }
-      }
-    } catch {
-      // Ignore inbox processing error
+    } catch (error) {
+      trace(this.#root, "process_failed", { sessionId: this.#sessionId, error: String(error) });
     } finally {
-      this.isProcessing = false;
+      this.#processing = false;
     }
   }
 
-  private isEntryInStore(id: string): boolean {
-    let entries: readonly unknown[] = [];
-    try {
-      entries = this.host.getEntries();
-    } catch {
-      return false;
-    }
-    return entries.some((e: unknown) => {
-      if (!e || typeof e !== "object") return false;
-      const rec = e as Record<string, unknown>;
-      const isCustomMessage =
-        rec.customType === "peer-message" ||
-        rec.type === "custom_message" ||
-        rec.type === "custom";
-      if (!isCustomMessage) return false;
-      const details = rec.details as Record<string, unknown> | undefined;
-      return details?.peerMessageId === id;
-    });
-  }
-
-  public async checkAckAgainstEntries(): Promise<void> {
-    if (this.inFlight.size === 0 && this.pendingResubmit.size === 0) return;
-
-    for (const [id] of Array.from(this.inFlight.entries())) {
-      if (this.isEntryInStore(id)) {
-        await this.ackMessage(id);
-      }
-    }
-
-    for (const [id, item] of Array.from(this.pendingResubmit.entries())) {
-      if (this.isEntryInStore(id)) {
-        this.pendingResubmit.delete(id);
-        await markDelivered(this.root, item.envelope, item.claimedPath, item.mode);
-      }
-    }
-  }
-
-  public async onMessageEnd(event: {
+  async onMessageEnd(event: {
     customType?: string;
     details?: Record<string, unknown>;
     message?: { customType?: string; details?: Record<string, unknown> };
   }): Promise<void> {
-    const isPeerMessage =
-      event.customType === "peer-message" ||
-      event.message?.customType === "peer-message";
-
-    if (!isPeerMessage) return;
-
-    const peerId =
-      event.details?.peerMessageId ||
-      event.message?.details?.peerMessageId;
-
-    if (typeof peerId === "string") {
-      await this.ackMessage(peerId);
-    }
+    const details = event.details ?? event.message?.details;
+    const type = event.customType ?? event.message?.customType;
+    if (type !== "peer-message" || details?.toSessionId !== this.#sessionId || typeof details.peerMessageId !== "string") return;
+    const tracked = this.#tracked.get(details.peerMessageId);
+    if (tracked) await this.#markAccepted(tracked);
   }
 
-  public async onAgentEnd(messages: readonly unknown[]): Promise<{ isAborted: boolean }> {
-    await this.checkAckAgainstEntries();
-
-    const isAborted = isRunAborted(messages);
-
-    // Any message still in inFlight at agent_end was not recorded during the run
-    for (const [id, item] of Array.from(this.inFlight.entries())) {
-      if (this.isEntryInStore(id)) {
-        await this.ackMessage(id);
-        continue;
+  async onAgentEnd(messages: readonly unknown[]): Promise<{ isAborted: boolean }> {
+    const aborted = isRunAborted(messages);
+    if (aborted) {
+      for (const tracked of this.#tracked.values()) {
+        if (tracked.record.phase !== "submitted") continue;
+        tracked.record.aborted = true;
+        try { await writeClaimRecord(tracked.claimedPath, tracked.record); } catch (error) {
+          trace(this.#root, "abort_state_unavailable", { messageId: tracked.record.envelope.id, error: String(error) });
+        }
       }
-
-      this.inFlight.delete(id);
-      this.pendingResubmit.set(id, {
-        envelope: item.envelope,
-        claimedPath: item.claimedPath,
-        mode: isAborted ? "appended" : "woke",
-      });
     }
-
-    return { isAborted };
+    await this.#reconcileTracked();
+    return { isAborted: aborted };
   }
 
-  public async ackMessage(
-    peerId: string,
-    forcedMode?: "woke" | "steered" | "appended"
-  ): Promise<void> {
-    const item = this.inFlight.get(peerId);
-    if (!item) return;
+  getInFlightCount(): number {
+    return this.#tracked.size;
+  }
 
-    this.inFlight.delete(peerId);
-    const mode = forcedMode ?? item.mode;
+  #canDeliver(): boolean {
+    return !this.#stopped && this.#isActive() && this.#host.getSessionId() === this.#sessionId;
+  }
 
+  #isMemoryAccepted(id: string): boolean {
     try {
-      await markDelivered(this.root, item.envelope, item.claimedPath, mode);
-    } catch {
-      // Ignore markDelivered error
+      return this.#host.getEntries().some((value) => {
+        if (!value || typeof value !== "object") return false;
+        const entry = value as Record<string, unknown>;
+        const message = entry.message && typeof entry.message === "object"
+          ? entry.message as Record<string, unknown>
+          : entry;
+        if (message.role !== "custom" || message.customType !== "peer-message") return false;
+        const details = message.details;
+        return !!details && typeof details === "object" &&
+          (details as Record<string, unknown>).peerMessageId === id &&
+          (details as Record<string, unknown>).toSessionId === this.#sessionId;
+      });
+    } catch (error) {
+      trace(this.#root, "entries_unavailable", { sessionId: this.#sessionId, error: String(error) });
+      return false;
     }
   }
 
-  public getInFlightCount(): number {
-    return this.inFlight.size + this.pendingResubmit.size;
+  async #reconcileTracked(): Promise<void> {
+    for (const tracked of [...this.#tracked.values()]) await this.#reconcileOne(tracked);
+  }
+
+  async #reconcileOne(tracked: TrackedMessage): Promise<void> {
+    if (!this.#canDeliver()) return;
+    const { envelope } = tracked.record;
+    const disk = await findPersistedPeerMessage(this.#host.getSessionFile(), this.#sessionId, envelope.id);
+    if (!this.#canDeliver()) return;
+    if (disk === "present") {
+      try {
+        await markDelivered(this.#root, tracked.record, tracked.claimedPath, this.#lastMode(tracked));
+        this.#tracked.delete(envelope.id);
+      } catch (error) {
+        trace(this.#root, "confirmation_unavailable", { messageId: envelope.id, error: String(error) });
+      }
+      return;
+    }
+    if (tracked.record.phase !== "accepted" && this.#isMemoryAccepted(envelope.id)) await this.#markAccepted(tracked);
+    if (!this.#canDeliver() || tracked.record.phase === "accepted") return;
+    const attempt = tracked.record.attempts.at(-1);
+    if (!attempt || Date.now() >= attempt.retryAfter) {
+      if (this.#host.isIdle() && !this.#host.hasPendingMessages()) {
+        await this.#submit(tracked, tracked.record.aborted ? "appended" : "woke");
+      }
+    }
+  }
+
+  async #markAccepted(tracked: TrackedMessage): Promise<void> {
+    if (tracked.record.phase === "accepted") return;
+    tracked.record.phase = "accepted";
+    try {
+      await writeClaimRecord(tracked.claimedPath, tracked.record);
+    } catch (error) {
+      trace(this.#root, "acceptance_unavailable", { messageId: tracked.record.envelope.id, error: String(error) });
+    }
+  }
+
+  async #submit(tracked: TrackedMessage, mode: DeliveryMode): Promise<void> {
+    if (!this.#canDeliver()) return;
+    const attemptNumber = tracked.record.attempts.length;
+    const delay = RETRY_DELAYS[Math.min(attemptNumber, RETRY_DELAYS.length - 1)];
+    tracked.record.phase = "submitted";
+    tracked.record.attempts.push({ id: randomUUID(), mode, submittedAt: Date.now(), retryAfter: Date.now() + delay });
+    try {
+      await writeClaimRecord(tracked.claimedPath, tracked.record);
+    } catch (error) {
+      trace(this.#root, "attempt_unavailable", { messageId: tracked.record.envelope.id, error: String(error) });
+      return;
+    }
+    if (!this.#canDeliver()) return;
+    const payload = {
+      customType: "peer-message",
+      content: renderIncomingPrompt(tracked.record.envelope),
+      display: true,
+      details: {
+        peerMessageId: tracked.record.envelope.id,
+        toSessionId: this.#sessionId,
+        from: tracked.record.envelope.from,
+        summary: tracked.record.envelope.summary,
+        body: tracked.record.envelope.body,
+        sentAt: tracked.record.envelope.sentAt,
+      },
+      attribution: "agent" as const,
+    };
+    try {
+      this.#host.sendMessage(payload, mode === "steered"
+        ? { triggerTurn: true, deliverAs: "steer" }
+        : { triggerTurn: mode === "woke" });
+      trace(this.#root, "message_submitted", { messageId: tracked.record.envelope.id, mode, attempt: attemptNumber + 1 });
+    } catch (error) {
+      trace(this.#root, "submission_rejected", { messageId: tracked.record.envelope.id, mode, error: String(error) });
+    }
+    if (this.#canDeliver() && this.#isMemoryAccepted(tracked.record.envelope.id)) await this.#markAccepted(tracked);
+  }
+
+  #lastMode(tracked: TrackedMessage): DeliveryMode {
+    return tracked.record.attempts.at(-1)?.mode ?? "woke";
   }
 }
