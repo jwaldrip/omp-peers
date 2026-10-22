@@ -10,7 +10,7 @@ Install from GitHub:
 omp plugin install "omp-peers@github:jwaldrip/omp-peers"
 ```
 
-This copies the package into OMP's plugin directory and records it in the plugin manifest, so it does not depend on any checkout staying on disk. Re-run the same command to update to the latest `main`; `omp plugin upgrade` compares package versions and reports a git install as up to date. Restart OMP sessions to load the extension. `/peers` shows discovery and mailbox status. The extension uses the host's TUI library and needs no mailbox daemon or socket service. Live proof has run on OMP 18.11.0 and 18.12.6.
+This copies the package into OMP's plugin directory and records it in the plugin manifest, so it does not depend on any checkout staying on disk. The install is pinned to the commit it resolved. Re-running the install command and `omp plugin upgrade` both leave that pin in place, so update with `cd ~/.omp/plugins && bun update omp-peers`. Restart OMP sessions to load the extension. `/peers` shows discovery and mailbox status. The extension uses the host's TUI library and needs no mailbox daemon or socket service. Live proof has run on OMP 18.11.0 and 18.12.6.
 
 For local development, `omp plugin link .` from a clone works, but the link is a symlink: if that directory is deleted (a cleaned-up worktree, for example), every new session silently starts without peer tools. `omp plugin doctor` reports it as `orphan:omp-peers`. Do not link a worktree for day-to-day use.
 
