@@ -4,17 +4,17 @@ Native cross-session messaging for [oh-my-pi](https://github.com/can1357/oh-my-p
 
 ## Install
 
-Clone this repository and link it from its directory:
+Install from GitHub:
 
 ```bash
-git clone https://github.com/jwaldrip/omp-peers.git
-cd omp-peers
-omp plugin link .
+omp plugin install "omp-peers@github:jwaldrip/omp-peers"
 ```
 
-Restart OMP sessions to load the extension. `/peers` shows discovery and mailbox status. The extension uses the host's TUI library and needs no mailbox daemon or socket service. Development and live proof are tested against OMP 18.11.0.
+This copies the package into OMP's plugin directory and records it in the plugin manifest, so it does not depend on any checkout staying on disk. Re-run the same command to update to the latest `main`; `omp plugin upgrade` compares package versions and reports a git install as up to date. Restart OMP sessions to load the extension. `/peers` shows discovery and mailbox status. The extension uses the host's TUI library and needs no mailbox daemon or socket service. Live proof has run on OMP 18.11.0 and 18.12.6.
 
-When replacing `pi-cross-session`, first run `omp plugin uninstall pi-cross-session`, then link this extension and restart each existing session. Old processes retain their old extension until restarted. The two transports do not interoperate, and old volatile queues are not migrated.
+For local development, `omp plugin link .` from a clone works, but the link is a symlink: if that directory is deleted (a cleaned-up worktree, for example), every new session silently starts without peer tools. `omp plugin doctor` reports it as `orphan:omp-peers`. Do not link a worktree for day-to-day use.
+
+When replacing `pi-cross-session`, first run `omp plugin uninstall pi-cross-session`, then install this extension and restart each existing session. Old processes retain their old extension until restarted. The two transports do not interoperate, and old volatile queues are not migrated.
 
 ## Tools
 

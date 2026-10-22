@@ -23,7 +23,7 @@ The driver creates isolated mailbox/session directories and loads only the speci
 
 `delivered` means confirmed in the on-disk transcript. At-least-once retries can duplicate uncertain wakes; the driver does not prove exactly-once action execution. Contract tests separately cover claim ownership, disk confirmation, replay, malformed records, lifecycle fences, and width-safe rendering.
 
-After linking the plugin, exercise normal global extension discovery with the same isolated mailbox and sessions:
+After installing the plugin (`omp plugin install "omp-peers@github:jwaldrip/omp-peers"`), exercise normal global extension discovery with the same isolated mailbox and sessions:
 
 ```bash
 bun scripts/prove-live.ts --omp ./scripts/installed-entry.sh --extension ./src/index.ts
