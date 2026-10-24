@@ -30,6 +30,8 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
   let subagent = false;
   let autocompleteInstalled = false;
   let retiredSessionId = "";
+  let reactivationTimer: NodeJS.Timeout | undefined;
+  let shuttingDown = false;
 
   const retire = (): void => {
     const retiring = binding;
@@ -40,10 +42,12 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     heartbeatTimer = undefined;
     deliveryMachine?.stop();
     deliveryMachine = null;
-    retireOwnerSync(root, retiring.sessionId, retiring.owner);
-    markOfflineSync(root, retiring.sessionId);
-    retiredSessionId = retiring.sessionId;
     binding = null;
+    retiredSessionId = retiring.sessionId;
+    try { retireOwnerSync(root, retiring.sessionId, retiring.owner); } catch (error) {
+      trace(root, "retirement_unavailable", { sessionId: retiring.sessionId, error: String(error) });
+    }
+    markOfflineSync(root, retiring.sessionId, retiring.owner.instanceId);
   };
 
   const updateHeartbeat = async (ctx: ExtensionContext, force?: "idle" | "busy" | "offline"): Promise<void> => {
@@ -63,6 +67,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
 
   const setupSession = async (ctx: ExtensionContext): Promise<void> => {
     if (isSubagentSession(ctx)) {
+      retire();
       subagent = true;
       const activeTools = pi.getActiveTools();
       const filtered = activeTools.filter((tool) => tool !== "list_pi" && tool !== "send_pi_message");
@@ -81,6 +86,8 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     };
     binding = next;
     retiredSessionId = "";
+    clearInterval(reactivationTimer);
+    reactivationTimer = undefined;
     await updateHeartbeat(ctx);
     if (!next.active || binding !== next || ctx.sessionManager.getSessionId() !== sessionId) return;
     const host = {
@@ -112,20 +119,41 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
     if (!binding && retiredSessionId && ctx.sessionManager.getSessionId() === retiredSessionId) void setupSession(ctx);
   };
 
+  const pauseForTransition = (ctx: ExtensionContext): void => {
+    retire();
+    clearInterval(reactivationTimer);
+    reactivationTimer = setInterval(() => {
+      if (shuttingDown || binding?.active) {
+        clearInterval(reactivationTimer);
+        reactivationTimer = undefined;
+        return;
+      }
+      // A canceled transition has no completion event in OMP 18.11.0. Retry the actually
+      // selected session automatically; recipient tags still fence late host admissions.
+      void setupSession(ctx).catch((error) => trace(root, "reactivation_unavailable", { error: String(error) }));
+    }, 500);
+    reactivationTimer.unref();
+  };
+
   pi.on("session_start", async (_event, ctx) => { await setupSession(ctx); });
-  pi.on("session_before_switch", () => { if (!subagent) retire(); });
-  pi.on("session_before_branch", () => { if (!subagent) retire(); });
+  pi.on("session_before_switch", (_event, ctx) => { if (!subagent) pauseForTransition(ctx); });
+  pi.on("session_before_branch", (_event, ctx) => { if (!subagent) pauseForTransition(ctx); });
   pi.on("session_switch", async (_event, ctx) => { await setupSession(ctx); });
   pi.on("session_branch", async (_event, ctx) => { await setupSession(ctx); });
-  pi.on("session_shutdown", () => { if (!subagent) retire(); });
+  pi.on("session_shutdown", () => {
+    shuttingDown = true;
+    clearInterval(reactivationTimer);
+    reactivationTimer = undefined;
+    if (!subagent) retire();
+  });
   pi.on("turn_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
   pi.on("agent_start", async (_event, ctx) => { reactivateIfCurrent(ctx); await updateHeartbeat(ctx, "busy"); });
   pi.on("turn_end", async (_event, ctx) => { await updateHeartbeat(ctx); void deliveryMachine?.processInbox(); });
   pi.on("agent_end", async (event, ctx) => { await updateHeartbeat(ctx); await deliveryMachine?.onAgentEnd(event.messages); void deliveryMachine?.processInbox(); });
   pi.on("message_end", async (event) => { await deliveryMachine?.onMessageEnd(event as Parameters<DeliveryStateMachine["onMessageEnd"]>[0]); });
 
-  pi.on("context", (event) => {
-    const currentSessionId = binding?.sessionId;
+  pi.on("context", (event, ctx) => {
+    const currentSessionId = ctx.sessionManager.getSessionId();
     const seen = new Set<string>();
     let modified = false;
     const messages: AgentMessage[] = [];
@@ -181,12 +209,12 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
       };
       await writeMessage(root, envelope);
       const receipt = recipient.isLive ? await waitForReceipt(root, senderId, envelope.id, 3000) : null;
-      const status: SendPiMessageDetails["status"] = receipt ? "delivered" : recipient.isLive ? "unconfirmed" : "queued_offline";
+      const status: SendPiMessageDetails["status"] = receipt ? "delivered" : recipient.isLive ? "queued" : "queued_offline";
       const details: SendPiMessageDetails = { status, mode: receipt?.mode, messageId: envelope.id, recipient: { sessionId: recipient.sessionId, name: recipient.name, cwd: recipient.cwd, live: recipient.isLive } };
       const text = receipt
         ? `Delivered to ${recipient.name} [${recipient.id8}]; confirmed in its persisted transcript.`
         : recipient.isLive
-          ? `${recipient.name} [${recipient.id8}] accepted the durable envelope or delivery remains unconfirmed. At-least-once wake retries may duplicate a rare wake.`
+          ? `Stored durably for ${recipient.name} [${recipient.id8}]; waiting for transcript confirmation. Delivery continues automatically.`
           : `${recipient.name} [${recipient.id8}] is offline; the envelope is queued for its next persistent session.`;
       return { content: [{ type: "text", text }], details };
     },
@@ -201,6 +229,7 @@ export default function ompPeersExtension(pi: ExtensionAPI): void {
         "OMP Peers status:", `  Current session: ${currentSessionId}`, `  Mailbox directory: ${root}`,
         "  Delivery is at-least-once. Delivered means confirmed in the recipient transcript.",
         "  Ephemeral sessions without a persisted transcript cannot provide durable resume proof.", "", "Registered sessions:",
+        `  Pending receipt: ${deliveryMachine?.getInFlightCount() ?? 0} message(s).`,
         ...(sessions.length ? sessions.map((session) => `  ${formatSessionLine(session)}`) : ["  (no other sessions found)"]),
       ].join("\n");
       ctx.ui?.notify?.(message);

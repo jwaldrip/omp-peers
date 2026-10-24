@@ -54,8 +54,8 @@ function machine(root: string, sessionId: string, host: Host): DeliveryStateMach
 
 function writeTranscript(file: string, sessionId: string, messageId?: string): void {
   const entries: unknown[] = [{ type: "session", id: sessionId }];
-  if (messageId) entries.push({ type: "message", message: { role: "custom", customType: "peer-message", details: { peerMessageId: messageId, toSessionId: sessionId } } });
-  fs.writeFileSync(file, `${entries.map(JSON.stringify).join("\n")}\n`);
+  if (messageId) entries.push({ type: "custom_message", id: `entry-${messageId}`, customType: "peer-message", details: { peerMessageId: messageId, toSessionId: sessionId } });
+  fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }
 
 describe("delivery recovery", () => {

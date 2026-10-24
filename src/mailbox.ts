@@ -12,7 +12,7 @@ import type {
 } from "./types.js";
 
 const MAX_TEXT_BYTES = 64 * 1024;
-const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 
 export function getPeersDir(): string {
@@ -144,12 +144,12 @@ export function writeAtomicFileSync(filePath: string, content: string): void {
   }
 }
 
-async function quarantine(root: string, source: string, reason: string): Promise<void> {
+export function quarantine(root: string, source: string, reason: string): void {
   const destination = path.join(root, "quarantine", `${Date.now()}-${randomUUID()}.json`);
   try {
-    await ensureDir(path.dirname(destination));
-    await fs.promises.rename(source, destination);
-    await fs.promises.writeFile(`${destination}.reason`, reason, { encoding: "utf8", mode: 0o600 });
+    ensureDirSync(path.dirname(destination));
+    fs.renameSync(source, destination);
+    fs.writeFileSync(`${destination}.reason`, reason, { encoding: "utf8", mode: 0o600 });
   } catch (error) {
     trace(root, "quarantine_failed", { source, reason, error: String(error) });
   }
@@ -171,42 +171,57 @@ function ownerPath(root: string, sessionId: string, owner: ClaimOwner): string {
   return path.join(ownerDir(root, sessionId, owner), "owner.json");
 }
 
-async function writeOwner(root: string, sessionId: string, owner: ClaimOwner): Promise<void> {
-  await writeAtomicFile(ownerPath(root, sessionId, owner), JSON.stringify(owner));
+function writeOwner(root: string, sessionId: string, owner: ClaimOwner): void {
+  writeAtomicFileSync(ownerPath(root, sessionId, owner), JSON.stringify(owner));
 }
 
 export async function claimOldestMessage(
   root: string,
   sessionId: string,
   owner: ClaimOwner,
+  isCurrent: () => boolean = () => true,
 ): Promise<{ record: ClaimedMessageRecord; claimedPath: string } | null> {
   if (!isSafeId(sessionId) || !parseClaimOwner(owner)) throw new Error("Invalid claim owner or recipient");
   const inbox = path.join(root, "inbox", sessionId);
   let names: string[];
   try { names = await fs.promises.readdir(inbox); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await ensureDir(inbox);
+      return null;
+    }
     trace(root, "inbox_unavailable", { sessionId, error: String(error) });
     return null;
   }
   const files = names.filter((name) => name.endsWith(".json") && !name.startsWith(".")).sort();
-  if (files.length === 0) return null;
+  if (files.length === 0 || !isCurrent()) return null;
+  // Acquisition is a synchronous critical section: retirement cannot run between the
+  // rename and the durable record write and leave a late claim under an old owner.
   const claimed = ownerDir(root, sessionId, owner);
-  await ensureDir(claimed);
-  await writeOwner(root, sessionId, owner);
+  ensureDirSync(claimed);
+  writeOwner(root, sessionId, owner);
   for (const name of files) {
     const source = path.join(inbox, name);
     const target = path.join(claimed, name);
-    try { await fs.promises.rename(source, target); } catch { continue; }
-    let parsed: PeerMessageEnvelope | null = null;
-    try { parsed = parseEnvelope(JSON.parse(await fs.promises.readFile(target, "utf8")), sessionId); } catch (error) {
-      trace(root, "message_read_failed", { source: target, error: String(error) });
-    }
-    if (!parsed || name !== filenameFor(parsed)) {
-      await quarantine(root, target, "invalid envelope or filename");
+    try { fs.renameSync(source, target); } catch { continue; }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(fs.readFileSync(target, "utf8"));
+    } catch (error) {
+      if (error instanceof SyntaxError) quarantine(root, target, "malformed message JSON");
+      else trace(root, "message_read_failed", { source: target, error: String(error) });
       continue;
     }
-    const record: ClaimedMessageRecord = { v: 1, envelope: parsed, phase: "pending", owner, attempts: [], aborted: false };
-    await writeAtomicFile(target, JSON.stringify(record));
+    const recovered = parseClaimRecord(raw, sessionId);
+    const parsed = recovered?.envelope ?? parseEnvelope(raw, sessionId);
+    if (!parsed || name !== filenameFor(parsed)) {
+      quarantine(root, target, "invalid envelope or filename");
+      continue;
+    }
+    const record: ClaimedMessageRecord = recovered
+      ? { ...recovered, owner, phase: recovered.phase === "accepted" ? "pending" : recovered.phase,
+          aborted: recovered.aborted || recovered.phase === "accepted" }
+      : { v: 1, envelope: parsed, phase: "pending", owner, attempts: [], aborted: false };
+    writeAtomicFileSync(target, JSON.stringify(record));
     trace(root, "message_claimed", { messageId: parsed.id, sessionId, instanceId: owner.instanceId });
     return { record, claimedPath: target };
   }
@@ -216,7 +231,7 @@ export async function claimOldestMessage(
 export async function writeClaimRecord(claimedPath: string, record: ClaimedMessageRecord): Promise<void> {
   assertRecord(record);
   if (path.basename(claimedPath) !== filenameFor(record.envelope)) throw new Error("Claim filename does not match envelope");
-  await writeAtomicFile(claimedPath, JSON.stringify(record));
+  writeAtomicFileSync(claimedPath, JSON.stringify(record));
 }
 
 export function retireOwnerSync(root: string, sessionId: string, owner: ClaimOwner): void {
@@ -241,6 +256,9 @@ async function restoreRecord(root: string, sessionId: string, source: string): P
   try {
     const raw = JSON.parse(await fs.promises.readFile(source, "utf8"));
     record = parseClaimRecord(raw, sessionId);
+    const envelope = record ? null : parseEnvelope(raw, sessionId);
+    if (envelope) record = { v: 1, envelope, phase: "pending",
+      owner: { instanceId: "recovered-owner", pid: process.pid, generation: 0 }, attempts: [], aborted: false };
   } catch (error) {
     trace(root, "reclaim_read_failed", { source, error: String(error) });
     return false;
@@ -350,7 +368,7 @@ export async function waitForReceipt(root: string, fromSessionId: string, messag
   while (Date.now() - started < timeoutMs) {
     const receipt = await readReceipt(root, fromSessionId, messageId);
     if (receipt) return receipt;
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await Bun.sleep(40);
   }
   return readReceipt(root, fromSessionId, messageId);
 }
@@ -364,7 +382,7 @@ async function countIn(directory: string, fromSessionId: string, expectedTo: str
     try {
       const raw = JSON.parse(await fs.promises.readFile(path.join(directory, file), "utf8"));
       const envelope = parseEnvelope(raw, expectedTo) ?? parseClaimRecord(raw, expectedTo)?.envelope;
-      if (envelope?.from.sessionId === fromSessionId) count++;
+      if (envelope && (!fromSessionId || envelope.from.sessionId === fromSessionId)) count++;
     } catch {}
   }
   return count;

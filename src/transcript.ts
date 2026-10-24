@@ -8,7 +8,7 @@ function isMatchingPeerMessage(value: unknown, peerMessageId: string, toSessionI
   const message = record.message && typeof record.message === "object"
     ? record.message as Record<string, unknown>
     : record;
-  if (message.role !== "custom" || message.customType !== "peer-message") return false;
+  if ((message.role !== "custom" && record.type !== "custom_message") || message.customType !== "peer-message") return false;
   const details = message.details;
   if (!details || typeof details !== "object") return false;
   const data = details as Record<string, unknown>;

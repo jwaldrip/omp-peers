@@ -24,6 +24,7 @@ describe("lifecycle and subagent exclusion", () => {
       name: "ShuttingDown",
       cwd: "/tmp",
       pid: process.pid,
+      instanceId: "shutdown-instance",
       startedAt: Date.now() - 5000,
       heartbeatAt: Date.now() - 1000,
       status: "idle",
@@ -44,50 +45,6 @@ describe("lifecycle and subagent exclusion", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("context dedupe drops duplicate peerMessageIds while keeping first occurrence", () => {
-    const messages = [
-      { role: "user", content: "hello" },
-      {
-        role: "custom",
-        customType: "peer-message",
-        details: { peerMessageId: "peer-id-1" },
-        content: "first occurrence of peer-id-1",
-      },
-      { role: "assistant", content: "thinking" },
-      {
-        role: "custom",
-        customType: "peer-message",
-        details: { peerMessageId: "peer-id-1" },
-        content: "duplicate occurrence of peer-id-1",
-      },
-      {
-        role: "custom",
-        customType: "peer-message",
-        details: { peerMessageId: "peer-id-2" },
-        content: "first occurrence of peer-id-2",
-      },
-    ];
-
-    const seenIds = new Set<string>();
-    const filtered: typeof messages = [];
-
-    for (const msg of messages) {
-      if (msg.role === "custom" && msg.customType === "peer-message") {
-        const peerId = msg.details?.peerMessageId;
-        if (peerId) {
-          if (seenIds.has(peerId)) {
-            continue;
-          }
-          seenIds.add(peerId);
-        }
-      }
-      filtered.push(msg);
-    }
-
-    expect(filtered.length).toBe(4);
-    expect(filtered[1].content).toBe("first occurrence of peer-id-1");
-    expect(filtered[3].content).toBe("first occurrence of peer-id-2");
-  });
 
   it("subagent exclusion: identifies subagent by artifacts parent session file", () => {
     const tempDir = createTempDir("omp-subagent-discrim");

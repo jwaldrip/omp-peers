@@ -8,6 +8,7 @@ import {
   markDelivered,
   reclaimDeadPidClaims,
   reclaimReleasedClaims,
+  retireOwnerSync,
   trace,
   writeClaimRecord,
 } from "./mailbox.js";
@@ -33,10 +34,10 @@ export function escapeXmlAttr(value: string): string {
 
 export function renderIncomingPrompt(message: PeerMessageEnvelope): string {
   const values: Record<string, string> = {
-    sender_name: escapeXmlAttr(message.from.name),
-    sender_session_id: escapeXmlAttr(message.from.sessionId),
-    sent_at: new Date(message.sentAt).toISOString(),
-    summary: message.summary ? escapeXmlAttr(message.summary) : "",
+    name: escapeXmlAttr(message.from.name),
+    sessionId: escapeXmlAttr(message.from.sessionId),
+    cwd: escapeXmlAttr(message.from.cwd),
+    sentIso: new Date(message.sentAt).toISOString(),
     body: message.body,
   };
   return incomingPromptTemplate.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => values[key] ?? "");
@@ -46,7 +47,16 @@ export function isRunAborted(messages: readonly unknown[]): boolean {
   for (const value of messages) {
     if (!value || typeof value !== "object") continue;
     const message = value as Record<string, unknown>;
-    if (message.stopReason === "aborted" || message.stopReason === "cancelled") return true;
+    const details = message.details;
+    if (message.role === "toolResult" && details && typeof details === "object" &&
+      (details as Record<string, unknown>).source === "assistant_stop_aborted") return true;
+  }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const value = messages[index];
+    if (value && typeof value === "object") {
+      const message = value as Record<string, unknown>;
+      if (message.role === "assistant") return message.stopReason === "aborted" || message.stopReason === "error";
+    }
   }
   return false;
 }
@@ -73,6 +83,8 @@ export class DeliveryStateMachine {
 
   async start(): Promise<void> {
     if (!this.#canDeliver()) return;
+    this.#pollTimer = setInterval(() => { void this.processInbox(); }, 500);
+    this.#pollTimer.unref();
     const inbox = path.join(this.#root, "inbox", this.#sessionId);
     try {
       await ensureDir(inbox);
@@ -90,9 +102,7 @@ export class DeliveryStateMachine {
     } catch (error) {
       trace(this.#root, "watch_unavailable", { sessionId: this.#sessionId, error: String(error) });
     }
-    this.#pollTimer = setInterval(() => { void this.processInbox(); }, 500);
-    this.#pollTimer.unref();
-    void this.processInbox();
+    await this.processInbox();
   }
 
   stop(): void {
@@ -101,6 +111,9 @@ export class DeliveryStateMachine {
     this.#watcher = null;
     clearInterval(this.#pollTimer);
     this.#pollTimer = undefined;
+    try { retireOwnerSync(this.#root, this.#sessionId, this.#owner); } catch (error) {
+      trace(this.#root, "retirement_unavailable", { sessionId: this.#sessionId, error: String(error) });
+    }
   }
 
   async processInbox(): Promise<void> {
@@ -114,13 +127,16 @@ export class DeliveryStateMachine {
       await reclaimDeadPidClaims(this.#root, this.#sessionId);
       if (!this.#canDeliver()) return;
       while (this.#canDeliver()) {
-        const claimed = await claimOldestMessage(this.#root, this.#sessionId, this.#owner);
+        const claimed = await claimOldestMessage(this.#root, this.#sessionId, this.#owner, () => this.#canDeliver());
         if (!this.#canDeliver() || !claimed) break;
         const tracked = { record: claimed.record, claimedPath: claimed.claimedPath };
         this.#tracked.set(claimed.record.envelope.id, tracked);
         await this.#reconcileOne(tracked);
         if (!this.#canDeliver()) break;
-        if (tracked.record.phase === "pending") await this.#submit(tracked, this.#host.isIdle() ? "woke" : "steered");
+        if (!this.#tracked.has(claimed.record.envelope.id)) continue;
+        if (tracked.record.phase === "pending" && !tracked.record.aborted) {
+          await this.#submit(tracked, this.#host.isIdle() ? "woke" : "steered");
+        }
         if (!this.#canDeliver() || this.#host.isIdle()) break;
       }
     } catch (error) {
@@ -173,7 +189,7 @@ export class DeliveryStateMachine {
         const message = entry.message && typeof entry.message === "object"
           ? entry.message as Record<string, unknown>
           : entry;
-        if (message.role !== "custom" || message.customType !== "peer-message") return false;
+        if ((message.role !== "custom" && message.type !== "custom_message") || message.customType !== "peer-message") return false;
         const details = message.details;
         return !!details && typeof details === "object" &&
           (details as Record<string, unknown>).peerMessageId === id &&
@@ -214,7 +230,7 @@ export class DeliveryStateMachine {
   }
 
   async #markAccepted(tracked: TrackedMessage): Promise<void> {
-    if (tracked.record.phase === "accepted") return;
+    if (!this.#canDeliver() || tracked.record.phase === "accepted") return;
     tracked.record.phase = "accepted";
     try {
       await writeClaimRecord(tracked.claimedPath, tracked.record);
@@ -229,6 +245,7 @@ export class DeliveryStateMachine {
     const delay = RETRY_DELAYS[Math.min(attemptNumber, RETRY_DELAYS.length - 1)];
     tracked.record.phase = "submitted";
     tracked.record.attempts.push({ id: randomUUID(), mode, submittedAt: Date.now(), retryAfter: Date.now() + delay });
+    if (tracked.record.attempts.length > 32) tracked.record.attempts.shift();
     try {
       await writeClaimRecord(tracked.claimedPath, tracked.record);
     } catch (error) {
